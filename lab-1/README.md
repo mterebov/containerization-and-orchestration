@@ -47,7 +47,7 @@ chmod +x ~/api && ~/api
 
 с помощью `pgrep -a api` был проверен PID - он совпал с тем, что отдала ручка `/whoami` как и должно быть
 
-![Тут было видно чта там PID совпадал](report/file-1e31e6e49272dce2d79691bf8f2991ae.png)
+![Тут было видно чта там PID совпадал](report/p1-pid-match.png)
 
 Так же был сделан снимок состояния ДО чтобы смотреть как оно меняется в процессе лабораторной
 
@@ -65,4 +65,65 @@ chmod +x ~/api && ~/api
 
 Для сравнения: namespaces init (PID 1) и фактические лимиты cgroup, в котором живёт процесс
 
-![namespaces init и лимиты cgroup](report/file-1a0471e35ffa6b754268fa82314df70c.png)
+![namespaces init и лимиты cgroup](report/p1-baseline-ref.png)
+
+## Часть 2 - namespaces
+Сначала с помощью
+
+``` bash
+pkill -x api
+```
+
+был остановлен api иначе curl бы попадал в старый экземпляр
+
+После была произведена попытка ~~поднять молот Тора~~ с помощью команды `unshare -Ur id -u` создать namespace и прописаться там как рутовый пользователь, namespace создался, а дальше, как я понял, прописаться туда рутом нам не позволила какая-то невероятная надстройка AppArmor'а, появившаяся в ubuntu 23.10, которая блокирует подобные действия
+
+![unshare -Ur: запись uid_map отбита AppArmor](report/p2-userns-eperm.png)
+
+~~Один был убит~~ Проклятие сняли отключив эту надстройку AppArmor'а командой `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 && unshare -Ur id -u`
+
+![после sysctl та же команда даёт uid 0](report/p2-userns-ok.png)
+
+Сначала нарочно запустили без --mount-proc. pid namespace уже новый, echo $$ внутри даёт 8, но ps читает /proc, а там смонтирован хостовый procfs, привязанный к pid namespace хоста: видны все процессы системы с хостовыми номерами, readlink /proc/self даёт 2719. Вывод: pid namespace изолирует нумерацию процессов, а что покажет ps, определяет mount namespace, то есть какой /proc смонтирован. Заодно виден user namespace: процессы настоящего root показаны как nobody, потому что uid 0 хоста внутрь не отображён, а unshare, api и bash показаны как root, потому что uid 1000 отображён в 0.
+
+![без --mount-proc: ps показывает хостовые процессы, echo $$ даёт 8](report/p2-no-mount-proc.png)
+
+### Запуск в namespaces
+
+```bash
+unshare --user --map-root-user --pid --fork --mount --mount-proc --net --uts --ipc ~/api
+```
+
+- `--user --map-root-user` стоит первым и без sudo: ядро создаёт user namespace и даёт процессу в нём полный набор capabilities, их хватает, чтобы создать остальные пять. uid 1000 снаружи отображается в 0 внутри.
+- `--pid --fork`: `unshare(CLONE_NEWPID)` не переносит вызывающий процесс, новый pid namespace получают только его дети. Поэтому unshare форкается, и PID 1 становится ребёнок, который делает exec в api.
+- `--mount --mount-proc`: свежий procfs для нового pid namespace монтируется поверх `/proc` в собственной таблице монтирования, хостовый `/proc` не трогается.
+- `--net`, `--uts`, `--ipc`: свой сетевой стек, свой hostname, свои объекты IPC.
+
+Вход внутрь, тоже без sudo, потому что владелец user namespace (uid 1000) имеет в нём все capabilities:
+
+```bash
+nsenter --preserve-credentials -t $(pgrep -x api) -U -p -m -n -u -i -- bash
+```
+
+Без `--preserve-credentials` nsenter падал на `setgroups failed`: `--map-root-user` записал `deny` в `/proc/PID/setgroups` (ядро требует этого до записи `gid_map` непривилегированным процессом), и `setgroups()`, который nsenter вызывает по умолчанию, в этом namespace невозможен.
+
+![внутри PID 1 и root, снаружи PID 2734 и ubuntu](report/p2-inside-outside.png)
+
+Внутри: `ps aux` показывает три процесса, api это PID 1. `id` даёт uid 0. `ip a` показывает только lo, и тот лежит, пока не поднять руками. После `hostname lab1-inside` и `ip link set lo up` ручка `/whoami` отвечает `pid=1 uid=0 hostname=lab1-inside`.
+
+Снаружи тот же процесс: PID 2734, user ubuntu, uid 1000. `/proc/2734/uid_map` содержит `0 1000 1`, то есть ровно один uid отображён. Hostname хоста по-прежнему lab1. `curl localhost:8080` с хоста не проходит: порт 8080 открыт в другом сетевом стеке.
+
+`ppid=0` у api внутри: родитель, процесс unshare (PID 2733 на хосте), остался в хостовом pid namespace и в новом не имеет номера. Для процессов, которых в namespace нет, ядро возвращает PID 0. Поэтому изнутри не виден даже собственный родитель.
+
+### Что изолировал каждый namespace
+
+| namespace | что изолировал | чем проверили |
+|---|---|---|
+| pid | нумерацию процессов: api внутри PID 1, снаружи 2734; видны только свои процессы | `ps aux` внутри, `ps -p` снаружи |
+| user | uid/gid: 0 внутри это 1000 снаружи; capabilities «root» действуют только внутри | `id`, `/proc/PID/uid_map`, процессы хостового root видны как nobody |
+| mnt | таблицу монтирования: свой `/proc`, хостовый не тронут | без `--mount-proc` ps показывал хостовые процессы |
+| net | сетевой стек: только lo, порт 8080 с хоста недоступен | `ip a` внутри, curl с хоста |
+| uts | hostname: lab1-inside внутри, lab1 снаружи | `hostname` внутри и снаружи |
+| ipc | объекты System V IPC и POSIX-очереди | отдельно не проверяли |
+
+Что осталось общим с хостом: корневая файловая система (внутри тот же `/home/ubuntu/api` и тот же `curl`: mount namespace копирует таблицу хоста, а не даёт новый корень, это закроет образ в части 6), ядро, cgroup (не трогали, это часть 3) и время.
