@@ -510,3 +510,6 @@ Prometheus и Grafana подняты через [monitoring/docker-compose.yml](
 ### Проверка алертов
 
 Под `/burn` правило про throttling провисело в `pending` ровно пять минут своего `for` и перешло в `firing` при доле throttled-периодов 95%. Потом `/eat?mb=50`: ядро убило api, `--restart=on-failure` поднял его заново (у контейнера `RestartCount` 1), в новой cgroup `memory.events` чистые, а cAdvisor счётчик `container_oom_events_total` для контейнера сохранил, он стал 1, и `ContainerOOMKilled` загорелся. Одна грабля вылезла сразу: первая версия правила про память горела на Prometheus, Grafana и api-gvisor, у которых лимита нет. У таких контейнеров cAdvisor отдаёт `container_spec_memory_limit_bytes` = 0, деление даёт `+Inf`, и `+Inf > 0.9` истина. Поэтому в правиле знаменатель обёрнут в `(... > 0)`: контейнеры без лимита из выражения выпадают.
+
+
+![alt text](report/otdyh.png)
