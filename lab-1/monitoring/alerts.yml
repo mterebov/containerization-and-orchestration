@@ -1,0 +1,23 @@
+groups:
+  - name: api
+    rules:
+      # Память подходит к потолку: следующий шаг ядра это OOM kill, а не замедление.
+      # (limit > 0): у контейнеров без лимита cAdvisor отдаёт 0, иначе деление даёт +Inf и ложный алерт.
+      - alert: ContainerMemoryNearLimit
+        expr: container_memory_working_set_bytes{name!=""} / (container_spec_memory_limit_bytes{name!=""} > 0) > 0.9
+        for: 1m
+        labels: { severity: warning }
+        annotations: { summary: "{{ $labels.name }}: memory above 90% of limit, OOM kill is next" }
+
+      # Контейнер упирается в CPU-квоту: ошибок нет, только растёт латентность.
+      - alert: ContainerCPUThrottled
+        expr: rate(container_cpu_cfs_throttled_periods_total{name!=""}[5m]) / rate(container_cpu_cfs_periods_total{name!=""}[5m]) > 0.25
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "{{ $labels.name }}: more than 25% of CPU periods throttled" }
+
+      # Уже убили: сервис падал, в Kubernetes это OOMKilled и CrashLoopBackOff.
+      - alert: ContainerOOMKilled
+        expr: increase(container_oom_events_total{name!=""}[10m]) > 0
+        labels: { severity: critical }
+        annotations: { summary: "{{ $labels.name }}: OOM killed in the last 10 minutes" }

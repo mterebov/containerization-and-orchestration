@@ -466,3 +466,47 @@ Seccomp            2, профиль Docker на api         2, собствен
 | rootfs | хостовый | overlay из образа | overlay из образа через gofer |
 | сеть | только lo | veth, bridge, NAT | netstack в Sentry плюс veth |
 | цена | ничего | ничего заметного | перехват каждого syscall |
+
+## Часть 8 - мониторинг
+### Откуда метрики
+
+Метрики контейнеров собирает cAdvisor: он читает те же файлы cgroup, что мы в части 3 смотрели руками (`memory.current`, `cpu.stat`, `pids.current`), и отдаёт их Prometheus'у. Образ cAdvisor живёт на `gcr.io`, куда из VM не достучаться, поэтому он стоит бинарником v0.60.6 с GitHub (скачан через Mac) и оформлен как systemd-сервис на порту 8088:
+
+```
+ExecStart=/home/ubuntu/cadvisor -port 8088 -housekeeping_interval=5s -enable_metrics=cpu,memory,oom_event,process,network -store_container_labels=false
+```
+
+Три грабли по дороге. Имена контейнеров: Docker 29 хранит образы в containerd, и с флагом `-containerd-namespace=moby` cAdvisor называл контейнеры по ID, а без него подхватилась Docker-фабрика, и в метриках появились `name="api"` и `name="api-gvisor"`. Метрики процессов (`container_processes`, `container_threads`, `container_threads_max`) входят в набор `process`, выключенный по умолчанию, включены через `-enable_metrics`. И `container_cpu_cfs_*` cAdvisor отдаёт только контейнерам с CPU-квотой: `api` из части 6 запускался без `--cpus`, поэтому перезапущен с теми же лимитами, что в части 5, плюс `--restart=on-failure`, чтобы после OOM подниматься самому, как это делает kubelet.
+
+Prometheus и Grafana подняты через [monitoring/docker-compose.yml](monitoring/docker-compose.yml) с `network_mode: host`: Prometheus скрейпит `localhost:8088` раз в 5 секунд ([prometheus.yml](monitoring/prometheus.yml)), источник данных и дашборд подложены в Grafana через provisioning ([grafana-datasource.yml](monitoring/grafana-datasource.yml), [dashboards/api.json](monitoring/dashboards/api.json)).
+
+### Дашборд
+
+Шесть панелей, всё про один контейнер `api`:
+
+| панель | запрос | зачем |
+|---|---|---|
+| память: working set и лимит | `container_memory_working_set_bytes`, `container_spec_memory_limit_bytes` | расстояние до OOM; working set, а не RSS, потому что именно его ядро считает невытесняемым |
+| CPU в ядрах и квота | `rate(container_cpu_usage_seconds_total[1m])`, `container_spec_cpu_quota / container_spec_cpu_period` | сколько реально получает против того, сколько разрешено |
+| доля throttled-периодов | `rate(container_cpu_cfs_throttled_periods_total[1m]) / rate(container_cpu_cfs_periods_total[1m])` | то же, что в части 3 читали из `cpu.stat`: доля периодов, в которых квота кончилась |
+| потоки и pids.max | `container_threads`, `container_threads_max` | запас до отказа в `fork`, в части 3 это были 7 потоков при лимите 20 |
+| OOM kills | `container_oom_events_total` | факт убийства, в Kubernetes это `OOMKilled` |
+| api и api-gvisor рядом | `container_memory_working_set_bytes{name=~"api\|api-gvisor"}` | gVisor-контейнер виден теми же метриками: Sentry живёт в такой же cgroup |
+
+![дашборд под нагрузкой](report/p8-dashboard.png)
+
+Под нагрузкой (`/burn` и `/eat?mb=30`): throttled-доля 93%, использование CPU упёрлось в 0.5 ядра, память 33 МБ из 64, потоков 8 из 20.
+
+### Три метрики для алертов
+
+Правила в [monitoring/alerts.yml](monitoring/alerts.yml), Prometheus загружает их и считает каждые 15 секунд.
+
+1. **Память выше 90% лимита в течение минуты** (`container_memory_working_set_bytes / (container_spec_memory_limit_bytes > 0) > 0.9`). Ловит приближение к потолку, пока ещё есть время что-то сделать: поднять лимит, найти утечку, отмасштабировать. Важно потому, что память, в отличие от CPU, не замедляет, а убивает: следующий шаг ядра это OOM kill без предупреждения.
+2. **Доля throttled-периодов выше 25% в течение пяти минут.** Ловит слишком низкий CPU-лимит. Важно потому, что throttling невидим: процесс жив, ошибок нет, health-check зелёный, а латентность растёт, и пользователи замечают это раньше, чем мониторинг по ошибкам.
+3. **OOM kill за последние десять минут** (`increase(container_oom_events_total[10m]) > 0`). Ловит уже случившееся. Первый алерт может не успеть, всплеск памяти укладывается в секунды, а здесь факт: сервис падал, всё, что было в памяти, потеряно, в Kubernetes это `OOMKilled` и `CrashLoopBackOff`, если повторяется.
+
+Чего нет и почему: нет алерта на число потоков, при `pids.max=20` и 8 потоках Go-рантайма он ловил бы только fork-бомбу, которой в сервисе нет. Нет и алерта на абсолютное использование CPU: высокий CPU сам по себе не проблема, проблема это throttling.
+
+### Проверка алертов
+
+Под `/burn` правило про throttling провисело в `pending` ровно пять минут своего `for` и перешло в `firing` при доле throttled-периодов 95%. Потом `/eat?mb=50`: ядро убило api, `--restart=on-failure` поднял его заново (у контейнера `RestartCount` 1), в новой cgroup `memory.events` чистые, а cAdvisor счётчик `container_oom_events_total` для контейнера сохранил, он стал 1, и `ContainerOOMKilled` загорелся. Одна грабля вылезла сразу: первая версия правила про память горела на Prometheus, Grafana и api-gvisor, у которых лимита нет. У таких контейнеров cAdvisor отдаёт `container_spec_memory_limit_bytes` = 0, деление даёт `+Inf`, и `+Inf > 0.9` истина. Поэтому в правиле знаменатель обёрнут в `(... > 0)`: контейнеры без лимита из выражения выпадают.
