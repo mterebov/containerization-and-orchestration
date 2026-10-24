@@ -406,3 +406,63 @@ ls: cannot access '...': No such file or directory
 ![файл в volume переживает контейнер](report/p6-volume.png)
 
 С volume файл пережил два контейнера: `apidata` это обычный каталог `/var/lib/docker/volumes/apidata/_data` на хосте, который bind-монтируется в `/data` поверх overlay. Он контейнеру не принадлежит, поэтому и не удаляется с ним. Так же устроен bind mount, и так же в Kubernetes PersistentVolume для postgres из примера курса: данные не в слое контейнера, а снаружи.
+
+## Часть 7 - когда контейнера мало: gVisor
+### Установка
+
+Из VM до бакета gVisor не достучаться (адреса Google на маке уходят в VPN), поэтому `runsc.deb` для arm64, release 20261019.0, скачан на Mac, сверен по SHA256 с индексом apt-репозитория и переброшен в VM через `multipass transfer`. Дальше:
+
+```bash
+sudo apt install -y ~/runsc.deb && sudo runsc install && sudo systemctl restart docker
+```
+
+`runsc install` дописал runtime в `/etc/docker/daemon.json`, в `docker info` появился `runsc` рядом с `runc`.
+
+### Тот же образ под gVisor
+
+```bash
+docker run -d --name api-gvisor --runtime=runsc -p 8081:8080 api:slim && curl localhost:8081/health
+```
+
+![api:slim под runsc отвечает](report/p7-gvisor-run.png)
+
+Образ тот же, Dockerfile тот же, в сервисе не изменилось ничего: runtime подменяется одним флагом. Изнутри (через alpine, в scratch нет шелла):
+
+![uname -r и dmesg под runc и под runsc](report/p7-gvisor-kernel.png)
+
+Под обычным runtime `uname -r` отдаёт хостовые `6.8.0-147-generic`. Под gVisor `4.19.0-gvisor`, а `dmesg` показывает «загрузку» ядра, которого не существует: это Sentry, ядро gVisor на Go, оно прикидывается Linux 4.19. Процесс внутри разговаривает с ним, а не с хостом.
+
+### Взгляд с хоста
+
+![с хоста: у api процесс api, у api-gvisor процесс gvisor_sentry](report/p7-host-view.png)
+
+```
+                   docker run (runc)                docker run --runtime=runsc
+процесс на хосте   api, PID 5820, 7 потоков         gvisor_sentry, PID 5510, 17 потоков и дочерние
+pgrep -x api       находит                          не находит: процесса api на хосте нет
+user namespace     хостовый                         свой, runsc создал его сам
+CapEff             a80425fb, 14 дефолтных           8001f: chown, dac_*, fowner, fsetid, sys_ptrace
+Seccomp            2, профиль Docker на api         2, собственный фильтр Sentry
+ядро внутри        6.8.0-147-generic, хостовое      4.19.0-gvisor, Sentry
+```
+
+### Как gVisor устроен иначе
+
+У обычного контейнера api это обычный процесс хоста под namespaces, и каждый его системный вызов исполняет ядро хоста. У gVisor между процессом и ядром стоит Sentry: отдельный процесс (`gvisor_sentry`), который реализует системные вызовы Linux сам, в userspace, на Go. Приложение живёт в дочернем процессе Sentry, его syscalls перехватываются (платформа systrap, через seccomp-ловушки) и уходят в Sentry, а не в ядро. Сам Sentry к хостовому ядру обращается узким набором из нескольких десятков вызовов под собственным seccomp-фильтром, к файлам ходит через отдельный процесс gofer, сеть реализует сам (netstack). Поэтому на хосте нет процесса `api`, а есть `gvisor_sentry` с потоками и детьми, и поэтому `uname` внутри «врёт» про 4.19.
+
+Почему это считается более изолированным: поверхность атаки на ядро хоста сужается с «все вызовы, которые разрешит seccomp» до нескольких десятков вызовов Sentry, а сам Sentry это непривилегированный процесс на memory-safe языке в своём user namespace с шестью capabilities. Баг в реализации какого-нибудь syscall ломает Sentry, а не ядро. Цена: каждый syscall дороже (перехват и переключение контекста), и часть вызовов не реализована, так что не всё под gVisor вообще запускается.
+
+### Что обычный контейнер всегда делит с хостом
+
+Ядро. Контейнер это процесс с наворотами: namespaces это метки на объектах внутри того же ядра, cgroups это его же учёт, а каждый системный вызов из контейнера исполняется кодом ядра хоста, тем самым, что показал `uname -r`. Поэтому уязвимость ядра, до которой можно дотянуться системным вызовом, это побег на хост со всем, что на нём есть, и seccomp только сужает поверхность, а не убирает её. Это и есть предел изоляции контейнера: она ровно такая, как надёжность ядра. gVisor подкладывает своё ядро между процессом и хостовым, виртуалки (Kata, Firecracker) дают отдельное настоящее ядро, и то и другое это уже не «просто процесс».
+
+### Три варианта рядом
+
+| | mydocker.sh | docker run (runc) | docker --runtime=runsc |
+|---|---|---|---|
+| кто исполняет syscalls | ядро хоста | ядро хоста | Sentry, затем узкий набор в ядро |
+| процесс на хосте | api, uid 1000 | api, root | gvisor_sentry, root в своём userns |
+| user namespace | свой | нет | свой |
+| rootfs | хостовый | overlay из образа | overlay из образа через gofer |
+| сеть | только lo | veth, bridge, NAT | netstack в Sentry плюс veth |
+| цена | ничего | ничего заметного | перехват каждого syscall |
