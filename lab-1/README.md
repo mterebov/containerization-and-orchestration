@@ -334,3 +334,75 @@ AppArmor         unconfined                         docker-default (enforce)
 **Что у нас есть, а у Docker по умолчанию нет.** Мы rootless: снаружи api это uid 1000, а у Docker без `userns-remap` root в контейнере это настоящий root хоста, и держит его только набор capabilities плюс seccomp. И `NoNewPrivs: 1` у нас выставлен автоматически libseccomp, у Docker его надо просить отдельно через `--security-opt no-new-privileges`.
 
 **Что Docker делает сверх этого.** Образы: pull по digest, слои, кеш, overlay. Демон и стек `dockerd → containerd → containerd-shim → runc`: runc делает ровно то, что наш скрипт, и выходит, а shim остаётся держать stdio и код выхода, поэтому у докерного api родитель это shim, а не клиент. Логи (`json-file`), сеть с DNS между контейнерами, volumes, healthcheck, env, и API, который снаружи дёргает kubelet через CRI.
+
+## Часть 6 - образы
+### Dockerfile и сборка
+
+Dockerfile'ы лежат рядом с кодом в [api/](api/). [Dockerfile.fat](api/Dockerfile.fat) собирает и запускает в одном образе `golang:1.22`. [Dockerfile](api/Dockerfile) это multi-stage: та же сборка в стадии `build`, а в итоговый образ `FROM scratch` копируется один бинарник. `CGO_ENABLED=0` в обоих обязателен: в `scratch` нет libc, пакет `net` при включённом cgo линкуется динамически, и такой бинарник там не стартует. `go.mod` копируется отдельной строкой раньше кода, чтобы слой с зависимостями переживал правки `main.go`. В `.dockerignore` лежит `bin/`, иначе локальный бинарник на 8 МБ уезжал бы в контекст каждой сборки.
+
+```bash
+multipass transfer -r lab-1/api lab1:api-src
+cd ~/api-src && docker build -t api:fat -f Dockerfile.fat . && docker build -t api:slim .
+```
+
+Собирал legacy builder: в пакете `docker.io` нет плагина buildx. Это тот самый линейный кеш из лекции, BuildKit ставится отдельно пакетом `docker-buildx`.
+
+### Размер и слои
+
+![docker images api и docker history](report/p6-images.png)
+
+| образ | disk usage | content size | строк в history | слоёв с содержимым |
+|---|---|---|---|---|
+| api:fat | 1.3 ГБ | 308 МБ | 16 | 11 |
+| api:slim | 10.7 МБ | 3.84 МБ | 3 | 1 |
+
+Разница в сто с лишним раз. В `api:fat` весь toolchain Go из `golang:1.22` (сам образ 1.22 ГБ) плюс кеш `go build`. В `api:slim` один слой на 6.9 МБ, это бинарник, а `EXPOSE` и `ENTRYPOINT` это строки по 0 байт, в них только метаданные конфига. Куда делись слои стадии `build`: они остались в кеше демона как промежуточные образы, а итоговый образ собирается только из последней стадии. `FROM scratch` даёт ноль слоёв, `COPY --from=build` добавляет один, и всё. Стадия `build` для итогового образа только источник файла.
+
+### Кеш
+
+Пересборка без изменений: все девять шагов `Using cache`, ничего не выполняется.
+
+![пересборка без изменений: всё из кеша](report/p6-cache-nochange.png)
+
+Потом в `main.go` добавлен комментарий и сборка повторена:
+
+```
+Sending build context to Docker daemon  12.29kB
+Step 1/9 : FROM golang:1.22 AS build
+Step 2/9 : WORKDIR /src                           ---> Using cache
+Step 3/9 : COPY go.mod ./                         ---> Using cache
+Step 4/9 : COPY main.go ./                        ---> новый слой
+Step 5/9 : RUN CGO_ENABLED=0 go build -o /api .   ---> Running in 196bb1a8a437
+Step 6/9 : FROM scratch
+Step 7/9 : COPY --from=build /api /api            ---> новый слой
+Step 8/9 : EXPOSE 8080                            ---> Running in e21cd7eaf4e3
+Step 9/9 : ENTRYPOINT ["/api"]                    ---> Running in 0d4e99099874
+Successfully built bd7f1fc447fb
+```
+
+Кеш отвалился ровно на `COPY main.go`: для `COPY` ключ кеша это контрольная сумма файлов, она изменилась, и всё ниже по Dockerfile пересобирается, потому что каждый следующий слой зависит от предыдущего. `WORKDIR` и `COPY go.mod` выше по файлу остались из кеша, ради этого `go.mod` и копируется отдельно. Первая попытка этого опыта показала всё из кеша: второй `multipass transfer -r` положил папку вложенно в `api-src/api/`, и собиралась старая копия, заодно с бинарником из `bin/` в контексте на 8 МБ. Разложили как надо, контекст снова 12 КБ.
+
+### Запуск slim-образа
+
+![api:slim вместо контейнера из части 5](report/p6-run-slim.png)
+
+### Файл в контейнере и volume
+
+![файл без volume: записали, пересоздали, нет](report/p6-no-volume.png)
+
+Записали `/tmp/f`, удалили контейнер, запустили новый из того же образа: файла нет. Он жил в writable-слое контейнера, верхнем слое overlayfs, и умер вместе с ним. `docker inspect -f '{{.GraphDriver...}}'` на скриншоте не сработал: Docker 29 держит образы в containerd (containerd image store), и этого поля в inspect больше нет, вместо него `ls` показал хостовый `/tmp`. Слой всё равно находится через mount контейнера:
+
+```
+$ sudo grep ' / overlay ' /proc/$(docker inspect -f '{{.State.Pid}}' t2)/mounts
+... upperdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/56/fs ...
+$ sudo ls -l /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/56/fs/tmp
+-rw-r--r-- 1 root root 6 Oct 24 15:53 f
+$ docker rm -f t2 && sudo ls /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/56/fs
+ls: cannot access '...': No such file or directory
+```
+
+Файл лежит на хосте в `upperdir` этого контейнера, `docker rm` сносит каталог целиком.
+
+![файл в volume переживает контейнер](report/p6-volume.png)
+
+С volume файл пережил два контейнера: `apidata` это обычный каталог `/var/lib/docker/volumes/apidata/_data` на хосте, который bind-монтируется в `/data` поверх overlay. Он контейнеру не принадлежит, поэтому и не удаляется с ним. Так же устроен bind mount, и так же в Kubernetes PersistentVolume для postgres из примера курса: данные не в слое контейнера, а снаружи.
