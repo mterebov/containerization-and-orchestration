@@ -127,3 +127,74 @@ nsenter --preserve-credentials -t $(pgrep -x api) -U -p -m -n -u -i -- bash
 | ipc | объекты System V IPC и POSIX-очереди | отдельно не проверяли |
 
 Что осталось общим с хостом: корневая файловая система (внутри тот же `/home/ubuntu/api` и тот же `curl`: mount namespace копирует таблицу хоста, а не даёт новый корень, это закроет образ в части 6), ядро, cgroup (не трогали, это часть 3) и время.
+
+## Часть 3 - cgroups
+### Шаг 1 - cgroup и переезд в него
+
+Cgroup в v2 это просто каталог в `/sys/fs/cgroup`: сделали `mkdir`, ядро само насыпало внутрь файлы-ручки. Какие контроллеры достанутся новой группе, решает `cgroup.subtree_control` родителя, у корня это `cpu memory pids`, ровно то, что нам нужно.
+
+```bash
+sudo mkdir /sys/fs/cgroup/mydocker && cat /sys/fs/cgroup/mydocker/cgroup.controllers
+echo $(pgrep -x api) | sudo tee /sys/fs/cgroup/mydocker/cgroup.procs
+echo $(pgrep -P $(pgrep -x nsenter)) | sudo tee /sys/fs/cgroup/mydocker/cgroup.procs
+```
+
+Переезд это запись PID в `cgroup.procs`, переезжают сразу все потоки процесса. Перенесли и api, и наш внутренний шелл из nsenter: дети наследуют cgroup при fork, так что всё, что мы из этого шелла запустим (curl, stress-ng), окажется под теми же лимитами. Переносили с хоста по хостовому PID, хотя api сидит в чужих namespaces: cgroups и namespaces друг о друге не знают, это две независимые оси, одна про «что процесс видит», другая про «сколько ему можно».
+
+![cgroup создан, api и шелл переехали](report/p3-cgroup-move.png)
+
+`/proc/PID/cgroup` сменился с `session-4.scope` (снимок «до» из части 1) на `/mydocker`. В `cgroup.procs` два PID, а `pids.current` показывает 7: контроллер pids считает не процессы, а задачи ядра, то есть потоки. Go-рантайм в api держит несколько потоков (GC, sysmon, сетевой поллер) плюс один поток bash. Поэтому `pids.max` надо брать с запасом над этим числом, а не «2 процесса», иначе api упрётся в лимит на первом же новом потоке.
+
+### Шаг 2 - CPU: полкора
+
+```bash
+echo "50000 100000" | sudo tee /sys/fs/cgroup/mydocker/cpu.max
+```
+
+Два числа это квота и период в микросекундах: 50 мс работы на каждые 100 мс, то есть половина ядра. Внутри дёрнули `/burn`, он крутит одну горутину на 100% ядра, api честно хотел целое ядро, а выдали половину.
+
+![/burn изнутри](report/p3-burn.png)
+
+![cpu.stat до и после 5 секунд](report/p3-cpu-stat.png)
+
+Два снимка `cpu.stat` с разницей в 5 секунд: `nr_periods` 96 → 146 (50 периодов по 100 мс = 5 секунд), `nr_throttled` 68 → 105, `throttled_usec` 4.97 с → 7.69 с, `usage_usec` 4.19 с → 6.51 с. То есть за 5 секунд api получил 2.3 секунды процессора (46%, упёрлось в квоту 50%) и 37 из 50 периодов просидел в throttle: квоту выбирает за первые 50 мс периода, остаток ждёт. Процесс при этом не умирает и никаких ошибок не видит, он просто тормозит. В Kubernetes это `limits.cpu`: kubelet пишет то же самое в `cpu.max`, а throttling снаружи виден только по метрике `container_cpu_cfs_throttled_periods_total` и по выросшей латентности.
+
+### Шаг 3 - pids.max против fork-бомбы
+
+```bash
+echo 20 | sudo tee /sys/fs/cgroup/mydocker/pids.max
+```
+
+20 с запасом над теми 7 потоками, что уже сидят в группе. Fork-бомбу пускали изнутри, из нашего шелла в nsenter, он в том же cgroup, так что всё, что он породит, считается в тот же `pids.current`. Первая попытка упала на `temp-path '.' must be readable and writeable`: после nsenter мы стоим в `/`, а он принадлежит настоящему root, для нашего «root внутри» это чужой `nobody`, писать нельзя. Ещё раз видно, что корень ФС общий с хостом. Ушли в `/tmp`.
+
+```bash
+cd /tmp && stress-ng --fork 8 --timeout 10s
+```
+
+![stress-ng --fork 8 изнутри](report/p3-forkbomb-stress.png)
+
+![pids.current и pids.events во время и под конец прогона](report/p3-forkbomb-pids.png)
+
+Сам stress-ng отчитался `passed: 8, failed: 0`: отказ `fork()` с `EAGAIN` он считает штатной ситуацией и молча пробует снова, поэтому его резюме выглядит как успех. Правда в cgroup: `pids.current` во время прогона стоял ровно на потолке 20 (7 потоков api и шелла, stress-ng с восемью воркерами, и всё, на детей места уже почти нет), а `pids.events` показывал `max 37465` и под конец `max 55217`: столько раз за 10 секунд ядро отказало в `fork`. Бомба не размножилась, api при этом жив и отвечает. В Docker это `--pids-limit`, в Kubernetes `podPidsLimit` у kubelet, оба пишут в тот же `pids.max`.
+
+### Шаг 4 - память и OOM
+
+```bash
+echo 64M | sudo tee /sys/fs/cgroup/mydocker/memory.max; echo 0 | sudo tee /sys/fs/cgroup/mydocker/memory.swap.max
+```
+
+`memory.swap.max=0` нужен, потому что иначе при упоре в лимит ядро сначала вытесняет страницы в своп, а не убивает. В нашей VM свопа нет, но скрипт из части 5 на это полагаться не должен; Kubernetes по умолчанию делает то же самое. Сначала съели 30 МБ:
+
+![/eat?mb=30](report/p3-eat-30.png)
+
+![memory.current после 30 МБ](report/p3-memory-current.png)
+
+`memory.current` = 33124352 байт, это 31.6 МиБ: 30 МиБ от `/eat` плюс немного нового. Память, которую api занял до переезда в cgroup, осталась на счету старой группы: списание идёт на ту группу, где страница была выделена, при переезде процесса оно не переезжает. Потом попросили ещё 50:
+
+![OOM: memory.events и dmesg](report/p3-oom.png)
+
+Curl получил `Killed`, и это убили не curl. В `memory.events`: `max 32` (32 раза группа упёрлась в лимит, и ядро пыталось что-то вытеснить, а вытеснять без свопа нечего), `oom 1`, `oom_kill 1`. В dmesg ядро перечислило задачи группы (api, bash, curl), выбрало самую жирную и написало `Memory cgroup out of memory: Killed process 1414 (api) anon-rss:64512kB`: 63 МиБ anon как раз и есть потолок 64M. Вместе с api умер и наш внутренний шелл: api это PID 1 своего pid namespace, а когда init namespace погибает, ядро добивает всех остальных в нём. Это и есть `OOMKilled` в Kubernetes: `limits.memory` превращается в тот же `memory.max`, kubelet видит код выхода 137 (SIGKILL), перезапускает контейнер, а если это повторяется, получается `CrashLoopBackOff`.
+
+### Итог части 3
+
+Память бьёт убийством, CPU бьёт задержкой, pids просто отказывает в `fork`. Все три лимита это файлы в одном каталоге cgroup, Docker и kubelet пишут в них ровно то же самое, что мы руками.
