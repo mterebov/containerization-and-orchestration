@@ -198,3 +198,82 @@ Curl получил `Killed`, и это убили не curl. В `memory.events`
 ### Итог части 3
 
 Память бьёт убийством, CPU бьёт задержкой, pids просто отказывает в `fork`. Все три лимита это файлы в одном каталоге cgroup, Docker и kubelet пишут в них ровно то же самое, что мы руками.
+
+## Часть 4 - привилегии
+### Шаг 1 - что умеет root внутри user namespace
+
+Api у нас живёт в user namespace как «root», и прежде чем что-то резать, стоило понять, что этот root вообще может. Свежий namespace со своим hostname:
+
+```bash
+unshare -Ur -u bash
+```
+
+![root в user namespace: полный набор, hostname меняется, время нет](report/p4-userns-caps.png)
+
+`CapEff` полный, все 41 бит, `hostname demo` проходит, а `date -s` отбивается с `Operation not permitted`, хотя набор тот же. Разница в том, где ядро проверяет capability. Для `sethostname` нужен `CAP_SYS_ADMIN` в том user namespace, которому принадлежит uts namespace, а он наш. Для `clock_settime` нужен `CAP_SYS_TIME` в корневом user namespace хоста: часы у ядра одни на всех, их не изолировать. Так что user namespace сам по себе уже отрезает всё, что не делится по namespace (время, модули ядра, reboot), а root внутри это root только над своими namespace.
+
+### Шаг 2 - отрезать всё
+
+```bash
+setpriv --bounding-set=-all --inh-caps=-all bash
+```
+
+![после setpriv: CapEff и CapBnd нули, hostname не меняется](report/p4-caps-dropped.png)
+
+`CapEff` и `CapBnd` нули, `hostname demo2` уже не проходит (hostname пишет «you must be root», хотя мы всё ещё uid 0, он просто так переводит EPERM). Bounding set это потолок, и он только опускается: системного вызова «поднять обратно» нет. Capabilities попадают в процесс двумя путями, через наследование при exec и через ambient-набор, и оба маскируются bounding set. Правило «root при exec получает всё» проходит через ту же маску. Поэтому ноль это навсегда, для процесса и всех его детей: ~~прыгнул в колодец без рук и ног~~.
+
+### Шаг 3 - api без единой capability
+
+Api они не нужны: порт 8080 выше 1024, файлы свои, ничего привилегированного он не делает. Поэтому запускаем его в тех же namespaces, но через setpriv:
+
+```bash
+unshare --user --map-root-user --pid --fork --mount --mount-proc --net --uts --ipc setpriv --bounding-set=-all --inh-caps=-all ~/api
+```
+
+![api стартует как PID 1 и отвечает на /health](report/p4-api-nocaps-start.png)
+
+![изнутри: lo поднят, /health отвечает](report/p4-api-nocaps-health.png)
+
+`ip link set lo up` изнутри проходит, потому что шелл из nsenter получает свои capabilities при входе в user namespace, ему мы ничего не резали. Api при этом работает как ни в чём не бывало. Снаружи:
+
+![все наборы capabilities у api нулевые, seccomp пока 0](report/p4-api-status.png)
+
+Все пять наборов по нулям, это пара к снимку «до» из части 1, где `CapBnd` был полный. `Seccomp: 0` пока, это следующий шаг.
+
+### Шаг 4 - seccomp
+
+Seccomp-профиль это список системных вызовов и что с ними делать: ядро сверяет с ним каждый syscall процесса и либо пропускает, либо возвращает ошибку, либо убивает. Capabilities отвечали «что процессу можно», seccomp отвечает «какими вызовами ядра он вообще может пользоваться». Профиль [seccomp.json](seccomp.json) в формате Docker: всё разрешено, кроме восьми вызовов, на них EPERM. `mkdir`/`mkdirat` там ради наглядной демонстрации, остальные это то, что api не нужно и что закрывает опасное: смена hostname, монтирование, отладка чужих процессов (`ptrace`), перезагрузка, загрузка модулей ядра. У Docker по умолчанию наоборот, белый список из ~350 вызовов, но для лабы хватило чёрного.
+
+Докера у нас нет, навесить профиль некому, поэтому навешивает маленький загрузчик [seccomp_exec.py](seccomp_exec.py): читает JSON, собирает фильтр через libseccomp, грузит его в ядро и делает `exec` в команду. Фильтр наследуется всеми детьми, и снять его процесс не может, как и вернуть capabilities. Сначала проверили на шелле:
+
+```bash
+python3 ~/seccomp_exec.py ~/seccomp.json -- bash
+```
+
+![mkdir отбит seccomp, Seccomp: 2](report/p4-seccomp-shell.png)
+
+`mkdir /tmp/zz` отбит с `Operation not permitted`, хотя у этого шелла есть все capabilities, а в `/tmp` писать можно кому угодно: это не права, это фильтр. В статусе `Seccomp: 2` (режим filter, в части 1 здесь был 0), `Seccomp_filters: 1` и `NoNewPrivs: 1`: libseccomp ставит этот флаг, чтобы фильтр можно было грузить без capabilities, а заодно он запрещает получать привилегии через setuid-бинарники.
+
+Потом api, полная цепочка «namespaces, seccomp, capabilities, api»:
+
+```bash
+unshare --user --map-root-user --pid --fork --mount --mount-proc --net --uts --ipc python3 ~/seccomp_exec.py ~/seccomp.json -- setpriv --bounding-set=-all --inh-caps=-all ~/api
+```
+
+![api стартует под профилем](report/p4-seccomp-api-start.png)
+
+![api: capabilities нули, Seccomp: 2](report/p4-seccomp-api-status.png)
+
+![api под профилем отвечает](report/p4-seccomp-api-health.png)
+
+Api работает: ему хватает `read`, `write`, `accept` и прочего обычного, ничего из чёрного списка он не зовёт.
+
+### Итог части 4
+
+Что закрывает каждый механизм:
+
+- **user namespace**: root внутри это root только над своими namespace. Всё, что не делится по namespace (время, модули ядра, reboot), отрезано ещё до capabilities.
+- **capabilities**: привилегированные действия внутри namespace (сменить hostname, поднять интерфейс, монтировать). Bounding set опущен в ноль, обратно не поднять.
+- **seccomp**: сами системные вызовы. Даже если бы capabilities вернулись, `mount` или `ptrace` упёрлись бы в фильтр. Это второй, независимый забор.
+
+Docker делает ровно то же: `--cap-drop`/`--cap-add` правят bounding set, `--security-opt seccomp=profile.json` грузит такой же JSON через libseccomp, по умолчанию с белым списком.

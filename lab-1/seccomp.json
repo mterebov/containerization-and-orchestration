@@ -1,0 +1,10 @@
+{
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "syscalls": [
+    {
+      "names": ["mkdir", "mkdirat", "sethostname", "mount", "umount2", "ptrace", "reboot", "init_module"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    }
+  ]
+}
