@@ -277,3 +277,60 @@ Api работает: ему хватает `read`, `write`, `accept` и про�
 - **seccomp**: сами системные вызовы. Даже если бы capabilities вернулись, `mount` или `ptrace` упёрлись бы в фильтр. Это второй, независимый забор.
 
 Docker делает ровно то же: `--cap-drop`/`--cap-add` правят bounding set, `--security-opt seccomp=profile.json` грузит такой же JSON через libseccomp, по умолчанию с белым списком.
+
+## Часть 5 - собираем свой Docker
+### mydocker.sh
+
+Все команды частей 2–4 собраны в [mydocker.sh](mydocker.sh): cgroup с лимитами, переезд в него и цепочка `unshare → lo up → seccomp → setpriv → api`. Два момента, ради которых скрипт устроен именно так. В части 3 мы переносили api в cgroup уже после старта, и между запуском и переносом он жил без лимитов. Поэтому скрипт сажает в cgroup сам себя (`echo $$ > cgroup.procs`) и только потом делает `exec`: дети наследуют группу, окна нет, так делают и настоящие runtime'ы. А `ip link set lo up` стоит внутри цепочки до `setpriv`: после сброса capabilities поднять интерфейс уже некому. `exec` на каждом шаге не меняет PID, поэтому api в итоге PID 1 своего namespace, а не ребёнок какого-нибудь sh.
+
+Запуск `./mydocker.sh` в одном окне, проверка во втором:
+
+![mydocker.sh: /health отвечает, cgroup /mydocker, capabilities нули, seccomp 2](report/p5-mydocker-check.png)
+
+### Тот же api через docker run
+
+Dockerfile будет в части 6, а пока статический бинарник просто подсунут в alpine через bind mount. Лимиты и права те же, что в скрипте: `--memory-swap` равный `--memory` это наш `memory.swap.max=0`, `--cpus 0.5` это `50000 100000`, профиль seccomp тот же файл.
+
+```bash
+docker run -d --name api -p 8080:8080 -v /home/ubuntu/api:/api:ro --memory 64m --memory-swap 64m --cpus 0.5 --pids-limit 20 --cap-drop ALL --security-opt seccomp=/home/ubuntu/seccomp.json alpine /api
+```
+
+![docker run и curl с хоста](report/p5-docker-run.png)
+
+Первое отличие видно сразу: `curl localhost:8080/health` с хоста работает без всяких nsenter. (Docker Hub из VM доставался через раз, часть его адресов на маке уходит в VPN, поэтому в `/etc/docker/daemon.json` прописаны `registry-mirrors`.)
+
+### Сравнение
+
+Оба api работали одновременно, с хоста снимали одно и то же для обоих процессов:
+
+```
+                 mydocker.sh                        docker run
+USER / UID       ubuntu / 1000                      root / 0
+user ns          свой (4026532228)                  хостовый (4026531837)
+pid mnt net      свои                               свои
+uts ipc
+cgroup ns        хостовый                           свой
+cgroup           /mydocker                          /system.slice/docker-<id>.scope
+memory.max       67108864 (64M), swap 0             67108864 (64M), swap 0
+cpu.max          50000 100000                       50000 100000
+pids.max         20                                 20
+CapEff / CapBnd  0 / 0                              0 / 0 (без --cap-drop было бы a80425fb, 14 штук)
+Seccomp          2, один фильтр, NoNewPrivs 1       2, один фильтр, NoNewPrivs 0
+AppArmor         unconfined                         docker-default (enforce)
+корень ФС        хостовый /, те же mounts           overlay из образа alpine, свои /proc и /dev
+сеть             только lo                          eth0 172.17.0.2 ↔ veth ↔ docker0, DNAT :8080
+```
+
+**Что совпадает.** Главное: тот же набор namespaces (кроме user и cgroup), те же четыре файла лимитов с теми же значениями, те же нули в capabilities и тот же seccomp-профиль с теми же восемью правилами. Ядро под обоими делает одно и то же, Docker тут не добавляет никакой магии, он пишет в те же файлы, что мы руками.
+
+**Чего не хватает нашему скрипту.**
+
+- Своей файловой системы: api видит весь хостовый корень. У Docker корень это overlay из образа, в него делается `pivot_root`, хост снаружи не виден. Это закроет часть 6.
+- Сети наружу: у нас пустой netns с одним lo, до сервиса не достучаться. Docker делает veth-пару, вешает её на bridge `docker0`, выдаёт 172.17.0.2 и пишет DNAT-правило в iptables для `-p 8080`.
+- cgroup namespace: внутри нашего контейнера `/proc/self/cgroup` показывает хостовый путь и видно всё дерево, Docker его прячет.
+- AppArmor-профиля: докерный процесс под `docker-default`, наш `unconfined`. Это третий слой из лекции, LSM, у нас его нет.
+- Жизненного цикла: имени, `stop`/`rm`/`exec`/`logs`, уборки cgroup после смерти (наш `/mydocker` остаётся висеть), restart policy, `--init` для зомби.
+
+**Что у нас есть, а у Docker по умолчанию нет.** Мы rootless: снаружи api это uid 1000, а у Docker без `userns-remap` root в контейнере это настоящий root хоста, и держит его только набор capabilities плюс seccomp. И `NoNewPrivs: 1` у нас выставлен автоматически libseccomp, у Docker его надо просить отдельно через `--security-opt no-new-privileges`.
+
+**Что Docker делает сверх этого.** Образы: pull по digest, слои, кеш, overlay. Демон и стек `dockerd → containerd → containerd-shim → runc`: runc делает ровно то, что наш скрипт, и выходит, а shim остаётся держать stdio и код выхода, поэтому у докерного api родитель это shim, а не клиент. Логи (`json-file`), сеть с DNS между контейнерами, volumes, healthcheck, env, и API, который снаружи дёргает kubelet через CRI.
