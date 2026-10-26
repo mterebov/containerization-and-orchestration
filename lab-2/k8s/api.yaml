@@ -29,6 +29,10 @@ spec:
           image: api:0.1.0
           # Образ уже лежит в containerd ноды (kind load), в реестр не ходим.
           imagePullPolicy: IfNotPresent
+          env:
+            # Куда слать трейсы: OTLP/HTTP-приёмник Jaeger. SDK сам допишет путь /v1/traces.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://jaeger.monitoring.svc:4318
           ports:
             # Имя порта: на него ссылаются пробы, Service и потом ServiceMonitor.
             - name: http

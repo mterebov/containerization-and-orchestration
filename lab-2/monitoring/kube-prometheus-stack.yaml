@@ -33,6 +33,22 @@ grafana:
       uid: loki
       url: http://loki.monitoring.svc:3100
       access: proxy
+      jsonData:
+        derivedFields:
+          - name: trace_id
+            matcherRegex: '"trace_id":"(\w+)"'
+            datasourceUid: jaeger
+            url: '$${__value.raw}'
+            urlDisplayLabel: Трейс в Grafana
+          - name: jaeger_ui
+            matcherRegex: '"trace_id":"(\w+)"'
+            url: 'http://localhost:16686/trace/$${__value.raw}'
+            urlDisplayLabel: Открыть в Jaeger UI
+    - name: Jaeger
+      type: jaeger
+      uid: jaeger
+      url: http://jaeger.monitoring.svc:16686
+      access: proxy
   dashboardProviders:
     dashboardproviders.yaml:
       apiVersion: 1

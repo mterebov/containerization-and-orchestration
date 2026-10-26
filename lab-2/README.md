@@ -174,3 +174,63 @@ for i in {1..20}; do curl -s localhost:8080/fail >/dev/null; sleep 1; done
 На дашборде теперь метрики и логи в одном месте: всплеск на графике ошибок и сами ошибки в панели логов внизу:
 
 ![дашборд api — RED с панелью логов ошибок](image-22.png)
+
+## Часть 3 — Трейсы (OpenTelemetry + Jaeger)
+
+Сервис был инструментирован OpenTelemetry ещё в части 0: корневой span на каждый запрос создаёт otelhttp, в `/slow` есть вложенный `slow-op`, в `/fail` — `fail-op` со статусом ошибки, а `trace_id` пишется в каждую строку лога. Не хватало только места, куда отправлять span: без адреса сервис их создавал, но никуда не слал (`exporting_spans:false` в логах).
+
+Что поменяли:
+
+- [monitoring/jaeger.yaml](monitoring/jaeger.yaml) — Jaeger v2 одним подом (all-in-one): принимает трейсы по OTLP и хранит их в памяти; выключили только трейсинг самого Jaeger, чтобы в списке сервисов был один `api`;
+- в [k8s/api.yaml](k8s/api.yaml) добавили переменную `OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger.monitoring.svc:4318` — адрес, куда SDK шлёт span;
+- в [monitoring/kube-prometheus-stack.yaml](monitoring/kube-prometheus-stack.yaml) добавили Jaeger как источник данных Grafana, а у Loki — ссылки из строки лога в трейс по `trace_id`.
+
+Подключили репозиторий и поставили Jaeger:
+
+![helm repo add jaegertracing и helm repo update](image-23.png)
+
+![helm upgrade --install jaeger](image-24.png)
+
+![под jaeger в Running](image-25.png)
+
+Применили обновлённый манифест api:
+
+```bash
+kubectl apply -f lab-2/k8s/api.yaml
+```
+
+Поды пересоздались, и теперь в логе старта `"exporting_spans":true` — span уходят в Jaeger, вайб:
+
+![rollout api и exporting_spans: true](image-26.png)
+
+Обновили Grafana, чтобы подтянулись источник Jaeger и ссылки у Loki:
+
+![helm upgrade monitoring, ревизия 3](image-27.png)
+
+Подали запросы: пять `/slow`, пять `/fail` и один `/load` на 20 запросов:
+
+![запросы к /slow, /fail и /load](image-28.png)
+
+В Jaeger появился сервис `api` и 11 трейсов. У `/fail` по 2 span, и оба с ошибкой, у `/slow` по 2 span на 1–3 секунды, а у `/load` 41 span: сам `/load` и 20 пар «клиентский запрос → `/health`». То есть `trace_id` передаётся и между запросами:
+
+![Jaeger: список трейсов api](image-29.png)
+
+Трейс `/slow`: почти все 2.3 секунды занимает вложенный `slow-op` (`sleep_ms = 2261`) — сразу видно, куда ушло время:
+
+![трейс /slow: slow-op на всё время запроса](image-30.png)
+
+Трейс `/fail`: оба span красные — корневой с кодом 500 и `fail-op` с `otel.status_description = simulated failure` и событием `exception`:
+
+![трейс /fail: красные span и событие exception](image-31.png)
+
+И переход из лога в трейс. В Explore у строки лога с ошибкой появились ссылки по её `trace_id`:
+
+![Loki: ссылки из строки лога в трейс](image-34.png)
+
+«Трейс в Grafana» открывает трейс прямо в Grafana:
+
+![трейс из лога в Grafana](image-32.png)
+
+«Открыть в Jaeger UI» открывает тот же трейс в Jaeger — `trace_id` совпадает с тем, что в логе (`66e7be8…`):
+
+![тот же трейс в Jaeger UI](image-33.png)
