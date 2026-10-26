@@ -8,6 +8,10 @@ kubeEtcd:
 kubeProxy:
   enabled: false
 
+defaultRules:
+  disabled:
+    NodeClockNotSynchronising: true
+
 prometheus:
   prometheusSpec:
     scrapeInterval: 15s
@@ -25,6 +29,108 @@ prometheus:
       endpoints:
         - port: http
           path: /metrics
+
+additionalPrometheusRulesMap:
+  api:
+    groups:
+      - name: api
+        rules:
+          - alert: ApiHighErrorRate
+            expr: |
+              sum(rate(http_request_errors_total{namespace="shop", job="api"}[5m]))
+                /
+              sum(rate(http_requests_total{namespace="shop", job="api"}[5m]))
+                > 0.05
+            for: 2m
+            labels:
+              severity: critical
+              namespace: shop
+              service: api
+            annotations:
+              summary: "api: {{ $value | humanizePercentage }} ответов с ошибкой 5xx"
+              description: "Больше 5% запросов к api заканчиваются ошибкой 5xx уже 2 минуты подряд."
+          - alert: ApiHighLatency
+            expr: |
+              histogram_quantile(0.95,
+                sum by (le) (rate(http_request_duration_seconds_bucket{namespace="shop", job="api"}[5m]))
+              ) > 1
+            for: 2m
+            labels:
+              severity: critical
+              namespace: shop
+              service: api
+            annotations:
+              summary: "api: p95 времени ответа {{ $value | humanizeDuration }}"
+              description: "95-й перцентиль времени ответа api выше 1 секунды уже 2 минуты подряд."
+          - alert: ApiDown
+            expr: absent(up{namespace="shop", job="api"} == 1)
+            for: 1m
+            labels:
+              severity: critical
+              namespace: shop
+              service: api
+            annotations:
+              summary: "api не отвечает: нет ни одного живого пода"
+              description: "Prometheus уже минуту не может забрать метрики ни с одного пода api."
+
+alertmanager:
+  config:
+    route:
+      receiver: webhook
+      group_by: [alertname, namespace]
+      group_wait: 10s
+      group_interval: 1m
+      repeat_interval: 4h
+      routes:
+        - receiver: "null"
+          matchers:
+            - alertname = "Watchdog"
+    receivers:
+      - name: "null"
+      - name: webhook
+        webhook_configs:
+          - url: http://alert-webhook.monitoring.svc:8080/alerts
+            send_resolved: true
+
+extraManifests:
+  - apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: alert-webhook
+      labels:
+        app.kubernetes.io/name: alert-webhook
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app.kubernetes.io/name: alert-webhook
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: alert-webhook
+        spec:
+          containers:
+            - name: echo
+              image: mendhak/http-https-echo:42
+              env:
+                - name: LOG_WITHOUT_NEWLINE
+                  value: "true"
+              ports:
+                - name: http
+                  containerPort: 8080
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: alert-webhook
+      labels:
+        app.kubernetes.io/name: alert-webhook
+    spec:
+      selector:
+        app.kubernetes.io/name: alert-webhook
+      ports:
+        - name: http
+          port: 8080
+          targetPort: http
 
 grafana:
   additionalDataSources:
