@@ -114,3 +114,63 @@ for i in {1..20}; do curl -s localhost:8080/slow >/dev/null; done
 Видим, что p95 времени ответа для `/slow` — примерно 2.9 секунды:
 
 ![дашборд после /slow: p95 /slow — 2.91 s](image-13.png)
+
+## Часть 2 — Логи (Loki + Alloy)
+
+Сам Loki логи не собирает, он их только хранит. Собирает агент Alloy, по одному на ноду он читает файлы логов контейнеров прямо на ноде и отправляет их в Loki (у него почемуто оранжевый значок - а не зеленый как по лору должен быть).
+
+Написали два файлика и дополнили третий:
+
+- [monitoring/loki.yaml](monitoring/loki.yaml) — Loki одним подом (SingleBinary), данные на диске ноды, без мультиарендности и лишних компонентов (шлюз, кеши, canary);
+- [monitoring/alloy.yaml](monitoring/alloy.yaml) — Alloy находит поды своей ноды, читает их логи из `/var/log/pods`, снимает обёртку containerd, у api разбирает JSON (`level` — в метку, `trace_id` — в structured metadata) и отправляет в Loki;
+- в [monitoring/kube-prometheus-stack.yaml](monitoring/kube-prometheus-stack.yaml) добавили Loki как источник данных Grafana и панель с логами ошибок на дашборд.
+
+Подключили репозиторий с чартами Grafana:
+
+![helm repo add grafana и helm repo update](image-14.png)
+
+Поставили Loki:
+
+![helm upgrade --install loki](image-15.png)
+
+Поставили Alloy:
+
+![helm upgrade --install alloy](image-17.png)
+
+Все поды стека запущены, loki и alloy тоже:
+
+![kubectl -n monitoring get pods: loki-0 и alloy в Running](image-18.png)
+
+Заглянули в UI самого Alloy — там виден весь путь логов
+
+![граф конвейера Alloy](image-19.png)
+
+Обновили Grafana, чтобы подтянулись источник Loki и новая панель:
+
+```bash
+helm upgrade --install monitoring prometheus-community/kube-prometheus-stack --version 92.14.0 -n monitoring -f lab-2/monitoring/kube-prometheus-stack.yaml
+```
+
+Проверили источник данных — Grafana видит Loki, жесткий + вайб:
+
+![Grafana: источник Loki успешно подключён](image-20.png)
+
+Насыпали ошибок:
+
+```bash
+for i in {1..20}; do curl -s localhost:8080/fail >/dev/null; sleep 1; done
+```
+
+И нашли их в Explore запросом:
+
+```
+{namespace="shop", app="api", level="ERROR"}
+```
+
+Строк 40 — на каждый `/fail` по две: `operation failed` с причиной `simulated failure` и строка самого запроса со статусом 500. У обеих один и тот же `trace_id`
+
+![Explore → Loki: ошибки /fail с trace_id](image-21.png)
+
+На дашборде теперь метрики и логи в одном месте: всплеск на графике ошибок и сами ошибки в панели логов внизу:
+
+![дашборд api — RED с панелью логов ошибок](image-22.png)
