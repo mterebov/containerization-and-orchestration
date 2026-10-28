@@ -39,3 +39,11 @@ postgres:
     limits:
       cpu: 500m
       memory: 512Mi
+
+monitoring:
+  enabled: true                  # ServiceMonitor и PrometheusRule рендерятся, только если в кластере есть их CRD
+  alerts:
+    errorRate: 0.05              # доля 5xx, выше которой ApiHighErrorRate
+    errorRateFor: 2m
+    ordersStuckFor: 2m
+    replicasUnavailableFor: 3m

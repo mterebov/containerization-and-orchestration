@@ -212,7 +212,7 @@ helm upgrade shop lab-3/shop -n shop --set api.healthFail=true
 helm rollback shop 8 -n shop
 ```
 
-Сломанный под сразу в `Terminating`, три старых как были, `ok`, в истории ревизия 10 с описанием `Rollback to 8`. Rollback это не «отменить», а новая ревизия со старым манифестом, поэтому история только растёт. И откатывает он кластер, а не файл: если бы мы ломали правкой `values.yaml`, следующий `upgrade` сломал бы всё снова, с `--set` этой проблемы нет.
+Сломанный под сразу в `Terminating`, три старых как были, `ok`, в истории ревизия 10 с описанием `Rollback to 8`. Rollback это не «отменить», а новая ревизия со старым манифестом, поэтому история только растёт. И откатывает он кластер, а не файл: если бы мы ломали правкой `values.yaml`, следующий `upgrade` сломал бы всё снова. С `--set` тоже не всё просто: в Helm 4 `upgrade` без флагов переиспользует values прошлого релиза, и `--set` прилипает к релизу до `--reset-values` (мы на это наступили в части 5). Rollback этой проблемы не имеет, он берёт values той ревизии, на которую откатывает.
 
 ![p2-rollback](report/p2-rollback.png)
 
@@ -350,3 +350,81 @@ kubectl -n shop create configmap control-plane-test && kubectl -n shop delete co
 ![p4-restored](report/p4-restored.png)
 
 ## Часть 5 - Мониторинг
+
+### Стек из лабы 2
+
+Новый стек не поднимали: тот же `kube-prometheus-stack` той же версии 92.14.0 и те же values, что в лабе 2. Файл `lab-3/monitoring/kube-prometheus-stack.yaml` это копия `lab-2/monitoring/kube-prometheus-stack.yaml`, из которой убрано то, что в этой лабе переезжает в чарт (ServiceMonitor для api, три алерта и дашборд), и datasources Loki/Jaeger, потому что их тут не ставим. Добавлена одна строка: `grafana.sidecar.dashboards.searchNamespace: ALL`, чтобы Grafana подхватывала дашборд из namespace `shop`. Alertmanager с webhook-получателем из лабы 2 остался как был.
+
+Сначала пробовали не копировать, а наложить второй `-f` с `additionalPrometheusRulesMap: {api: null}`: по документации `null` удаляет ключ, но при наложении двух пользовательских файлов Helm 4 оставил ключ пустым, и шаблон стека упал на nil. Поэтому один файл.
+
+``` bash
+helm upgrade --install monitoring prometheus-community/kube-prometheus-stack --version 92.14.0 -n monitoring --create-namespace -f lab-3/monitoring/kube-prometheus-stack.yaml
+```
+
+![p5-stack](report/p5-stack.png)
+
+### Что добавили в чарт
+
+Три шаблона в `lab-3/shop/templates/`:
+
+- `servicemonitor.yaml`: один `ServiceMonitor` на оба сервиса. Он выбирает Service-ы по лейблу `app.kubernetes.io/name in (api, worker)`, берёт их endpoints и ходит в `/metrics` на порт `http` каждого пода; `jobLabel` делает из лейбла метку `job=api` / `job=worker`. Scrape-конфиг Prometheus из этого объекта собирает Prometheus Operator, руками в Prometheus ничего не правили. Тут же видно, зачем в части 1 было правило про обязательный лейбл: без него под не найдут ни Service, ни мониторинг.
+- `prometheusrule.yaml`: три алерта, оператор превращает объект в rule-файл и перечитывает Prometheus.
+- `grafana-dashboard.yaml`: ConfigMap с лейблом `grafana_dashboard: "1"`, JSON берётся из `dashboards/shop.json` через `.Files.Get`. Sidecar Grafana видит лейбл и подкладывает дашборд.
+
+`ServiceMonitor` и `PrometheusRule` рендерятся только если в кластере есть их CRD (`.Capabilities.APIVersions.Has "monitoring.coreos.com/v1"`), поэтому чарт ставится с нуля и в кластер без стека мониторинга, просто без этих двух объектов.
+
+``` bash
+helm upgrade shop lab-3/shop -n shop
+kubectl -n shop get servicemonitor,prometheusrule && kubectl -n shop get cm shop-dashboard --show-labels
+```
+
+![p5-objects](report/p5-objects.png)
+
+Prometheus через минуту видит все пять подов, три api и два worker, все `UP`:
+
+![p5-targets](report/p5-targets.png)
+
+Дашборд «Lab 3: shop» в Grafana, шесть панелей: RPS api по кодам, доля 5xx, p95, заказы создано/обработано за 5 минут, `db_up` по подам, реплики api desired/available/unavailable. Три из них это ровно те выражения, на которых стоят алерты, чтобы было видно, что алерт считает.
+
+![p5-dashboard](report/p5-dashboard.png)
+
+### Три алерта и зачем они
+
+- **ApiHighErrorRate**: доля 5xx у api больше 5% две минуты подряд. Классический RED-алерт про ошибки. Ловит и сломанный код, и отвалившуюся базу, потому что `POST /order` без базы отдаёт 503. Порог и окно вынесены в values.
+- **OrdersNotProcessed**: за последние 5 минут заказы создавались, а worker не обработал ни одного, и так две минуты. Бизнес-алерт: все поды могут быть зелёные, а заказы висят, и это единственное, что волнует пользователя. В выражении `or vector(0)`: когда worker-ов нет совсем, метрики `worker_orders_processed_total` нет, и без этого алерт молчал бы именно тогда, когда нужен.
+- **ApiReplicasUnavailable**: у Deployment `api` дольше трёх минут есть недоступные реплики, метрика из kube-state-metrics. Это застрявшая раскатка из части 2 или поды, которые не проходят readiness. Три минуты, чтобы обычная раскатка по одному поду не шумела.
+
+### Поджигаем
+
+Убрали worker через `--set worker.replicas=0` и создали три заказа. Через две с половиной минуты (`for: 2m` плюс интервал evaluation) `OrdersNotProcessed` в `firing`:
+
+![p5-firing-terminal](report/p5-firing-terminal.png)
+
+![p5-firing](report/p5-firing.png)
+
+Alertmanager его получил и отправил в webhook из лабы 2:
+
+![p5-alertmanager](report/p5-alertmanager.png)
+
+Рядом всегда горит `Watchdog` из стандартных правил стека: это «пульс», алерт, который должен гореть постоянно, чтобы по его пропаже понять, что сломался сам мониторинг. В values лабы 2 он уходит в receiver `null`.
+
+Вернули worker. Тут мы и наступили на Helm 4: `helm upgrade` без флагов переиспользовал values прошлого релиза, `worker.replicas: 0` переехал в новую ревизию, и подов worker так и не стало. Починили `helm upgrade --reset-values`: он берёт только values чарта. После этого worker обработал зависшие заказы, и алерт погас сам.
+
+## Итог
+
+Что получилось, по списку из задания:
+
+- **Guardrails до чарта.** Kyverno и пять cluster-wide правил стоят раньше `shop`, пять кривых подов отбиты, infra-namespace исключены явно. По дороге правила поймали и то, что мы не писали: Job оператора и helper-под провиженера.
+- **Чарт `shop` ставится с нуля.** Порядок: Kyverno → политики → CloudNativePG → стек мониторинга → `helm install shop`. Без стека мониторинга чарт тоже ставится, просто без ServiceMonitor и PrometheusRule.
+- **Self-healing.** Под api возвращает ReplicaSet-контроллер (с новым именем), под postgres возвращает оператор (с тем же именем и тем же томом).
+- **Падение control plane.** Без etcd нельзя ничего поменять, но api, worker и postgres отвечают через NodePort и ClusterIP, потому что путь трафика живёт в iptables на ноде, а не в apiserver. Вернули манифест, кластер снова управляемый.
+- **Мониторинг поверх стека лабы 2.** Дашборд и три алерта едут в чарте, один алерт подожгли и показали в firing.
+
+Где что лежит:
+
+- `api/`, `worker/`: код и Dockerfile.
+- `kind.yaml`: кластер с пробросом NodePort.
+- `kyverno-values.yaml`, `policies/`, `policies/bad/`: движок, пять правил, пять кривых подов.
+- `shop/`: чарт, включая `Cluster` для postgres, `ServiceMonitor`, `PrometheusRule` и дашборд.
+- `monitoring/kube-prometheus-stack.yaml`: values стека из лабы 2 под эту лабу.
+- `report/`: скрины.
