@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  labels:
+    app.kubernetes.io/name: api
+spec:
+  replicas: {{ .Values.api.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1          # сначала поднять один новый под...
+      maxUnavailable: 0    # ...и только потом убрать один старый: по одному, без просадки
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: api   # require-labels, autogen проверяет именно template
+    spec:
+      securityContext:
+        runAsNonRoot: true            # require-nonroot
+      containers:
+        - name: api
+          image: "{{ .Values.api.image.repository }}:{{ .Values.api.image.tag }}"
+          imagePullPolicy: IfNotPresent
+          lifecycle:
+            preStop:
+              sleep:                    # под в Terminating ещё 5с принимает трафик, пока kube-proxy
+                seconds: 5              # убирает его из endpoints; SIGTERM приходит только после sleep
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: HEALTH_FAIL
+              value: {{ .Values.api.healthFail | quote }}
+          readinessProbe:             # не готов = убрать из endpoints сервиса, трафик не идёт
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:              # не жив = kubelet перезапустит контейнер
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}

@@ -133,7 +133,88 @@ kubectl -n shop get pods
 
 Попутно два манифеста с первого раза упали не на Kyverno: в одном имя пода было с заглавными буквами, в другом `privileged` лежал в `securityContext` пода, а такого поля там нет. Первый отбила встроенная валидация apiserver, второй не прошёл декодирование по схеме. Порядок в apiserver такой: декодирование → встроенная валидация → admission-вебхуки, и политики видят только то, что прошло первые два шага.
 
-## Часть 2 - потрогать Helm-чарт 
+## Часть 2 - потрогать Helm-чарт
+
+### Чарт
+
+Helm коротко: чарт это папка с `Chart.yaml`, `values.yaml` и `templates/`, где лежат обычные манифесты с подстановками из values. Helm рендерит их и применяет, кластер видит только обычные объекты. Установленная копия это release, каждый `install`/`upgrade` даёт новую ревизию (хранится Secret-ом в namespace), поэтому есть `helm rollback`. Values накладываются слоями: дефолты чарта → `-f` файлы → `--set`.
+
+Чарт лежит в `lab-3/shop/`: `Chart.yaml`, `values.yaml` и четыре шаблона, Deployment и Service для `api` и для `worker`. В values все ручки: образ и тег, replicas (3 для api и 2 для worker), `healthFail`, `resources`, nodePort для api. Правила из части 1 зашиты сразу: лейбл `app.kubernetes.io/name` в `template`, `resources.limits`, `runAsNonRoot: true`, образы `shop.local/*`. Пробы readiness и liveness обе на `/health`. Service у api типа NodePort 30080 (тот самый порт из `kind.yaml`), у worker обычный ClusterIP, он нужен не для трафика, а под `ServiceMonitor` в части 5.
+
+Стратегия раскатки задана явно: `maxSurge: 1`, `maxUnavailable: 0`. Это и даёт «по одному»: сначала поднять один новый под, дождаться его readiness, потом убрать один старый.
+
+Перед установкой чарт прогнали через `helm template ... | kubectl apply --dry-run=server`: server dry-run проходит через admission, то есть через Kyverno, и autogen проверяет Deployment как под. Поэтому сама установка прошла с первого раза без отказов по политикам, те же отказы мы видели в части 1 на кривых подах.
+
+``` bash
+helm upgrade --install shop lab-3/shop -n shop && kubectl -n shop get pods -w
+```
+
+![p2-install](report/p2-install.png)
+
+``` bash
+curl -s localhost:30080/health; curl -s localhost:30080/version; kubectl -n shop get deploy,svc
+```
+
+![p2-curl](report/p2-curl.png)
+
+### Reconciliation
+
+Удалили под api руками: через секунду на его месте новый, с другим суффиксом, у ReplicaSet `DESIRED 3 CURRENT 3`. Это не Helm и не мы, это ReplicaSet-контроллер увидел, что status разъехался со spec, и починил.
+
+![p2-delete-pod](report/p2-delete-pod.png)
+
+Поменяли в `values.yaml` `api.replicas: 4` и сделали `helm upgrade`: четвёртый под появился, `DESIRED 4`. Потом вернули 3 тем же способом.
+
+![p2-replicas](report/p2-replicas.png)
+
+### Rolling update под нагрузкой
+
+Собрали `shop.local/api:0.2.0` (версия зашивается в бинарник через `--build-arg VERSION`, её отдаёт `/version`) и загрузили в kind.
+
+![p2-build-020](report/p2-build-020.png)
+
+Дальше в фоне долбилка: `curl /health` через NodePort каждые 50 мс, печатает только не-200 и итог. На её фоне меняем `api.image.tag` на `0.2.0` и делаем `helm upgrade`. В `rollout status` видно, что поды меняются по одному: `1 out of 3`, `2 out of 3`, `1 old replicas are pending termination`. Старый ReplicaSet ушёл в 0, новый в 3, все три отвечают `0.2.0`.
+
+Но долбилка поймала один `FAIL code=000` из 778, ровно в момент удаления последнего старого пода:
+
+![p2-rolling-fail](report/p2-rolling-fail.png)
+
+Это известная гонка. Когда под уходит в `Terminating`, параллельно происходят две независимые вещи: kubelet шлёт контейнеру SIGTERM, а endpoints-контроллер убирает под из Service и kube-proxy переписывает iptables на ноде. Наш api по SIGTERM сразу закрывает listener (честный graceful shutdown: дослужить начатое, новых не брать), а iptables ещё несколько десятков миллисекунд ведут на него. Новое соединение упирается в закрытый порт, отсюда `000`, connection refused.
+
+Лечится `preStop`-хуком в Deployment api: под в `Terminating` ещё 5 секунд принимает трафик, за это время kube-proxy успевает выкинуть его из endpoints, и только потом приходит SIGTERM. Образ от `scratch`, бинарника `sleep` в нём нет, поэтому нативный `sleep`-хук Kubernetes, а не `exec`:
+
+``` yaml
+lifecycle:
+  preStop:
+    sleep:
+      seconds: 5
+```
+
+Раскатали эту правку, собрали `0.3.0` и повторили тот же прогон: 792 запроса, `fail=0`, все три пода на `0.3.0`.
+
+![p2-rolling-ok](report/p2-rolling-ok.png)
+
+### Сломанная версия и rollback
+
+`HEALTH_FAIL=true` передали через `--set api.healthFail=true`: это верхний слой values поверх файла, файл остаётся чистым, а ломать одноразово удобно. На фоне той же долбилки:
+
+``` bash
+helm upgrade shop lab-3/shop -n shop --set api.healthFail=true
+```
+
+Через 45 секунд картина: один новый под `0/1 Running` с рестартами (readiness не пускает его в Service, liveness на том же `/health` его перезапускает), три старых `1/1`, `/health` снаружи отдаёт `ok`, долбилка 796 запросов без единой ошибки. При этом Helm записал ревизию 9 как `deployed`: он только отправил объекты в apiserver, а раскатка это дело Deployment-контроллера, который из-за `maxUnavailable: 0` не трогает старые поды, пока новый не станет Ready. А он не станет никогда.
+
+![p2-broken](report/p2-broken.png)
+
+Откат на последнюю хорошую ревизию:
+
+``` bash
+helm rollback shop 8 -n shop
+```
+
+Сломанный под сразу в `Terminating`, три старых как были, `ok`, в истории ревизия 10 с описанием `Rollback to 8`. Rollback это не «отменить», а новая ревизия со старым манифестом, поэтому история только растёт. И откатывает он кластер, а не файл: если бы мы ломали правкой `values.yaml`, следующий `upgrade` сломал бы всё снова, с `--set` этой проблемы нет.
+
+![p2-rollback](report/p2-rollback.png)
 
 ## Часть 3 - Слон в ящике
 
