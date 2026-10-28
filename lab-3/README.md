@@ -294,4 +294,59 @@ shop-db-1   Bound    pvc-bba814b8-0c1b-4e8e-ac12-2cd042e48094   1Gi        RWO  
 
 ## Часть 4 - Chaos Engineering эксперимент
 
+### Как роняли
+
+На kind `etcd`, `kube-apiserver`, `controller-manager` и `scheduler` это статические поды: kubelet сам запускает их из `/etc/kubernetes/manifests/` на ноде и сам же перезапустит, если просто убить контейнер. Поэтому гасили не контейнер, а манифест: убрали `etcd.yaml` из этой папки, kubelet увидел, что пода в желаемом состоянии больше нет, и остановил его.
+
+``` bash
+docker exec lab-control-plane mv /etc/kubernetes/manifests/etcd.yaml /root/etcd.yaml
+docker exec lab-control-plane crictl ps --name etcd
+kubectl get nodes --request-timeout=10s
+```
+
+Через 15 секунд контейнера etcd в `crictl ps` нет, а `kubectl get nodes` отваливается по таймауту: apiserver живой и принимает соединение, но без etcd ему неоткуда взять состояние, он висит на запросе к нему, и клиент не дожидается.
+
+![p4-etcd-down](report/p4-etcd-down.png)
+
+### Изменения не проходят
+
+``` bash
+kubectl -n shop create configmap control-plane-test --request-timeout=10s
+helm upgrade shop lab-3/shop -n shop --set api.replicas=4 --timeout 30s
+```
+
+Оба падают. `kubectl` с `context deadline exceeded`, helm ещё раньше, чем дошёл до самого upgrade: он сначала читает Secret-ы с ревизиями релиза, и уже этот `get secrets` не отвечает. Ничего записать нельзя, потому что записывать некуда.
+
+![p4-no-changes](report/p4-no-changes.png)
+
+### А сервис живой
+
+``` bash
+curl -s localhost:30080/health
+curl -s -X POST localhost:30080/order -d '{"item":"no-etcd","qty":1}'
+sleep 7; curl -s localhost:30080/orders
+```
+
+`/health` отвечает `ok`, новый заказ создался в базе, через семь секунд worker его обработал. То есть без control plane работают все три: api принимает трафик, worker ходит в postgres, postgres пишет на том.
+
+![p4-still-alive](report/p4-still-alive.png)
+
+### Что пережило падение и почему
+
+Мы выключили только «смотрителя». Сами контейнеры это обычные процессы на ноде под containerd, им apiserver для работы не нужен. Но пережили не только контейнеры: путь трафика тоже не зависит от control plane. NodePort обслуживают iptables-правила, которые kube-proxy настроил раньше, они остаются в ядре, а `shop-db-rw` это такой же ClusterIP с уже настроенными правилами. Kubelet тоже продолжает жить своей жизнью: гоняет пробы и перезапустил бы упавший контейнер. Именно поэтому в `kind.yaml` заранее был NodePort, а не `kubectl port-forward`: port-forward ходит через apiserver и лёг бы вместе с ним.
+
+Что перестало работать: всё, что требует желаемого состояния. Нельзя задеплоить, отскейлить, откатить. И self-healing тоже встал: удалённый под не вернётся, пока etcd лежит, потому что ReplicaSet-контроллер и оператор не могут ни прочитать spec, ни записать status. Кластер в этом состоянии не умер, он заморожен в последнем известном состоянии.
+
+### Возвращаем
+
+``` bash
+docker exec lab-control-plane mv /root/etcd.yaml /etc/kubernetes/manifests/etcd.yaml
+kubectl get nodes && kubectl -n shop get pods
+kubectl -n shop create configmap control-plane-test && kubectl -n shop delete configmap control-plane-test
+```
+
+Вернули манифест на место, kubelet поднял etcd, через полминуты `get nodes` отвечает, все поды в `shop` на месте с теми же именами и без рестартов, ConfigMap создаётся и удаляется. Кластер снова управляемый, и ничего не пришлось чинить руками: данные в etcd лежали на диске, контроллеры после старта просто продолжили с того же места.
+
+![p4-restored](report/p4-restored.png)
+
 ## Часть 5 - Мониторинг
