@@ -1,0 +1,81 @@
+# api в кластере: namespace shop, Deployment на две реплики и Service перед ними.
+# Применяется одной командой: kubectl apply -f lab-2/k8s/api.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shop
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: shop
+  labels:
+    app.kubernetes.io/name: api
+spec:
+  replicas: 2
+  # Какие поды принадлежат этому Deployment: ReplicaSet находит их только по меткам.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api
+  # Шаблон пода. Метки здесь обязаны совпасть с selector выше.
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: api
+    spec:
+      containers:
+        - name: api
+          image: api:0.1.0
+          # Образ уже лежит в containerd ноды (kind load), в реестр не ходим.
+          imagePullPolicy: IfNotPresent
+          env:
+            # Куда слать трейсы: OTLP/HTTP-приёмник Jaeger. SDK сам допишет путь /v1/traces.
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://jaeger.monitoring.svc:4318
+          ports:
+            # Имя порта: на него ссылаются пробы, Service и потом ServiceMonitor.
+            - name: http
+              containerPort: 8080
+          # Не готов — убрать из трафика Service. Это дёшево, поэтому проба чувствительная.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 2
+          # Завис — перезапустить контейнер. Это дорого, поэтому проба терпимее.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            # Сколько scheduler резервирует на ноде под этот под.
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            # Лимит только на память: при утечке OOM убьёт контейнер, а не задавит ноду.
+            # Лимит на CPU не ставим: квота даёт throttling (лаба 1), и /load
+            # тормозил бы из-за CFS, а не из-за кода.
+            limits:
+              memory: 128Mi
+---
+# Service находит поды не по имени Deployment, а по той же метке.
+# Своя метка нужна, чтобы в части 1 его нашёл ServiceMonitor.
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: shop
+  labels:
+    app.kubernetes.io/name: api
+spec:
+  selector:
+    app.kubernetes.io/name: api
+  ports:
+    # targetPort ссылается на именованный порт контейнера, а не на число.
+    - name: http
+      port: 8080
+      targetPort: http

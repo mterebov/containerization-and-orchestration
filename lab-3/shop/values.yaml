@@ -1,0 +1,49 @@
+# Все ручки чарта. Шаблоны читают только отсюда: то, чего здесь нет, в шаблоне захардкожено.
+api:
+  image:
+    repository: shop.local/api   # образ грузится в kind, реестр в имени нужен правилу restrict-registry
+    tag: "0.3.0"                 # bump этого значения = rolling update
+  replicas: 3
+  healthFail: "false"            # "true" ломает /health, нужно для сломанной версии
+  resources:                     # limits обязательны по require-limits
+    requests:
+      cpu: 50m
+      memory: 32Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+  service:
+    nodePort: 30080              # совпадает с extraPortMappings в kind.yaml
+
+worker:
+  image:
+    repository: shop.local/worker   
+    tag: "0.1.0"                 
+  replicas: 2
+  healthFail: "false"           
+  resources:                     
+    requests:
+      cpu: 50m
+      memory: 32Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+postgres:
+  instances: 1                   # одна нода postgres, без реплик: kind на ноутбуке
+  storage: 1Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+monitoring:
+  enabled: true                  # ServiceMonitor и PrometheusRule рендерятся, только если в кластере есть их CRD
+  alerts:
+    errorRate: 0.05              # доля 5xx, выше которой ApiHighErrorRate
+    errorRateFor: 2m
+    ordersStuckFor: 2m
+    replicasUnavailableFor: 3m

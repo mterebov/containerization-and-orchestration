@@ -1,0 +1,4 @@
+jaeger:
+  extraEnv:
+    - name: OTEL_TRACES_SAMPLER
+      value: always_off

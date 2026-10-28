@@ -1,0 +1,17 @@
+# Объект оператора CloudNativePG. Мы описываем только желаемое состояние (spec),
+# поды, PVC, сервисы shop-db-rw/-ro/-r и секрет shop-db-app создаёт оператор.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: shop-db
+  labels:
+    app.kubernetes.io/name: shop-db
+spec:
+  instances: {{ .Values.postgres.instances }}
+  storage:
+    size: {{ .Values.postgres.storage }}
+  resources:                        # уедут в контейнер postgres: require-limits
+    {{- toYaml .Values.postgres.resources | nindent 4 }}
+  inheritedMetadata:                # лейблы, которые оператор навесит на свои поды: require-labels
+    labels:
+      app.kubernetes.io/name: shop-db

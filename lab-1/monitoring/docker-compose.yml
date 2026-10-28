@@ -1,0 +1,17 @@
+# Минимальный стек для части 8: Prometheus собирает метрики cAdvisor (он работает
+# на хосте VM как systemd-сервис на :8088), Grafana рисует. network_mode: host,
+# чтобы Prometheus видел localhost:8088, а Grafana была доступна с Mac на :3000.
+services:
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    network_mode: host
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+  grafana:
+    image: grafana/grafana:12.1.0
+    network_mode: host
+    volumes:
+      - ./grafana-datasource.yml:/etc/grafana/provisioning/datasources/ds.yml:ro
+      - ./grafana-dashboards.yml:/etc/grafana/provisioning/dashboards/lab1.yml:ro
+      - ./dashboards:/var/lib/grafana/dashboards:ro

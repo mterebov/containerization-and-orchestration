@@ -1,0 +1,259 @@
+
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeEtcd:
+  enabled: false
+kubeProxy:
+  enabled: false
+
+defaultRules:
+  disabled:
+    NodeClockNotSynchronising: true
+
+prometheus:
+  prometheusSpec:
+    scrapeInterval: 15s
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+
+  additionalServiceMonitors:
+    api:
+      namespaceSelector:
+        matchNames: [shop]
+      selector:
+        matchLabels:
+          app.kubernetes.io/name: api
+      endpoints:
+        - port: http
+          path: /metrics
+
+additionalPrometheusRulesMap:
+  api:
+    groups:
+      - name: api
+        rules:
+          - alert: ApiHighErrorRate
+            expr: |
+              sum(rate(http_request_errors_total{namespace="shop", job="api"}[5m]))
+                /
+              sum(rate(http_requests_total{namespace="shop", job="api"}[5m]))
+                > 0.05
+            for: 2m
+            labels:
+              severity: critical
+              namespace: shop
+              service: api
+            annotations:
+              summary: "api: {{ $value | humanizePercentage }} ответов с ошибкой 5xx"
+              description: "Больше 5% запросов к api заканчиваются ошибкой 5xx уже 2 минуты подряд."
+          - alert: ApiHighLatency
+            expr: |
+              histogram_quantile(0.95,
+                sum by (le) (rate(http_request_duration_seconds_bucket{namespace="shop", job="api"}[5m]))
+              ) > 1
+            for: 2m
+            labels:
+              severity: critical
+              namespace: shop
+              service: api
+            annotations:
+              summary: "api: p95 времени ответа {{ $value | humanizeDuration }}"
+              description: "95-й перцентиль времени ответа api выше 1 секунды уже 2 минуты подряд."
+          - alert: ApiDown
+            expr: absent(up{namespace="shop", job="api"} == 1)
+            for: 1m
+            labels:
+              severity: critical
+              namespace: shop
+              service: api
+            annotations:
+              summary: "api не отвечает: нет ни одного живого пода"
+              description: "Prometheus уже минуту не может забрать метрики ни с одного пода api."
+
+alertmanager:
+  config:
+    route:
+      receiver: webhook
+      group_by: [alertname, namespace]
+      group_wait: 10s
+      group_interval: 1m
+      repeat_interval: 4h
+      routes:
+        - receiver: "null"
+          matchers:
+            - alertname = "Watchdog"
+    receivers:
+      - name: "null"
+      - name: webhook
+        webhook_configs:
+          - url: http://alert-webhook.monitoring.svc:8080/alerts
+            send_resolved: true
+
+extraManifests:
+  - apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: alert-webhook
+      labels:
+        app.kubernetes.io/name: alert-webhook
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app.kubernetes.io/name: alert-webhook
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: alert-webhook
+        spec:
+          containers:
+            - name: echo
+              image: mendhak/http-https-echo:42
+              env:
+                - name: LOG_WITHOUT_NEWLINE
+                  value: "true"
+              ports:
+                - name: http
+                  containerPort: 8080
+  - apiVersion: v1
+    kind: Service
+    metadata:
+      name: alert-webhook
+      labels:
+        app.kubernetes.io/name: alert-webhook
+    spec:
+      selector:
+        app.kubernetes.io/name: alert-webhook
+      ports:
+        - name: http
+          port: 8080
+          targetPort: http
+
+grafana:
+  additionalDataSources:
+    - name: Loki
+      type: loki
+      uid: loki
+      url: http://loki.monitoring.svc:3100
+      access: proxy
+      jsonData:
+        derivedFields:
+          - name: trace_id
+            matcherRegex: '"trace_id":"(\w+)"'
+            datasourceUid: jaeger
+            url: '$${__value.raw}'
+            urlDisplayLabel: Трейс в Grafana
+          - name: jaeger_ui
+            matcherRegex: '"trace_id":"(\w+)"'
+            url: 'http://localhost:16686/trace/$${__value.raw}'
+            urlDisplayLabel: Открыть в Jaeger UI
+    - name: Jaeger
+      type: jaeger
+      uid: jaeger
+      url: http://jaeger.monitoring.svc:16686
+      access: proxy
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: lab
+          folder: Lab 2
+          type: file
+          options:
+            path: /var/lib/grafana/dashboards/lab
+  dashboards:
+    lab:
+      api-red:
+        json: |
+          {
+            "uid": "api-red",
+            "title": "api — RED",
+            "tags": ["lab2"],
+            "schemaVersion": 39,
+            "refresh": "10s",
+            "time": { "from": "now-15m", "to": "now" },
+            "panels": [
+              {
+                "id": 1,
+                "type": "timeseries",
+                "title": "Rate — запросы в секунду по ручкам",
+                "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+                "datasource": { "type": "prometheus", "uid": "prometheus" },
+                "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+                "targets": [
+                  {
+                    "refId": "A",
+                    "expr": "sum by (route) (rate(http_requests_total{namespace=\"shop\", job=\"api\"}[$__rate_interval]))",
+                    "legendFormat": "{{route}}"
+                  }
+                ]
+              },
+              {
+                "id": 2,
+                "type": "timeseries",
+                "title": "Errors — доля ответов 5xx",
+                "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
+                "datasource": { "type": "prometheus", "uid": "prometheus" },
+                "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0 }, "overrides": [] },
+                "targets": [
+                  {
+                    "refId": "A",
+                    "expr": "sum(rate(http_request_errors_total{namespace=\"shop\", job=\"api\"}[$__rate_interval])) / sum(rate(http_requests_total{namespace=\"shop\", job=\"api\"}[$__rate_interval]))",
+                    "legendFormat": "доля 5xx"
+                  }
+                ]
+              },
+              {
+                "id": 3,
+                "type": "timeseries",
+                "title": "Duration — p95 времени ответа",
+                "gridPos": { "h": 9, "w": 12, "x": 0, "y": 9 },
+                "datasource": { "type": "prometheus", "uid": "prometheus" },
+                "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+                "targets": [
+                  {
+                    "refId": "A",
+                    "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{namespace=\"shop\", job=\"api\"}[$__rate_interval])))",
+                    "legendFormat": "все запросы"
+                  },
+                  {
+                    "refId": "B",
+                    "expr": "histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_bucket{namespace=\"shop\", job=\"api\"}[$__rate_interval])))",
+                    "legendFormat": "{{route}}"
+                  }
+                ]
+              },
+              {
+                "id": 4,
+                "type": "timeseries",
+                "title": "Запросы в секунду по подам",
+                "gridPos": { "h": 9, "w": 12, "x": 12, "y": 9 },
+                "datasource": { "type": "prometheus", "uid": "prometheus" },
+                "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+                "targets": [
+                  {
+                    "refId": "A",
+                    "expr": "sum by (pod) (rate(http_requests_total{namespace=\"shop\", job=\"api\"}[$__rate_interval]))",
+                    "legendFormat": "{{pod}}"
+                  }
+                ]
+              },
+              {
+                "id": 5,
+                "type": "logs",
+                "title": "Логи api: ошибки",
+                "gridPos": { "h": 10, "w": 24, "x": 0, "y": 18 },
+                "datasource": { "type": "loki", "uid": "loki" },
+                "options": { "showTime": true, "wrapLogMessage": true, "sortOrder": "Descending", "enableLogDetails": true },
+                "targets": [
+                  {
+                    "refId": "A",
+                    "expr": "{namespace=\"shop\", app=\"api\", level=\"ERROR\"}"
+                  }
+                ]
+              }
+            ]
+          }

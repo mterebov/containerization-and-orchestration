@@ -1,0 +1,13 @@
+# kind-кластер для лабы 3.
+# extraPortMappings пробрасывает порт мака 30080 на порт 30080 узла, т.е. на NodePort.
+# Нужно для Part 4: NodePort обслуживает kube-proxy на самом узле, без apiserver,
+# а kubectl port-forward идёт через apiserver и умрёт вместе с control plane.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: lab
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 30080
+        protocol: TCP

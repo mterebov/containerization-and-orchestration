@@ -1,0 +1,21 @@
+{{- if and .Values.monitoring.enabled (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1") }}
+# Prometheus Operator сам соберёт scrape-конфиг: найдёт Service-ы по лейблу,
+# возьмёт их endpoints и будет ходить в /metrics на порт http каждого пода.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: shop
+  labels:
+    app.kubernetes.io/name: shop
+spec:
+  jobLabel: app.kubernetes.io/name      # job=api / job=worker в метриках
+  selector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values: [api, worker]
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+{{- end }}

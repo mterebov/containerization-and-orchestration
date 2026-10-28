@@ -1,0 +1,6 @@
+FROM golang:1.22
+WORKDIR /src
+COPY go.mod ./
+COPY main.go ./
+RUN CGO_ENABLED=0 go build -o /api .
+CMD ["/api"]

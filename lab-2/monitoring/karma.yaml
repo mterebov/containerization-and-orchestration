@@ -1,0 +1,3 @@
+env:
+  - name: ALERTMANAGER_URI
+    value: http://monitoring-kube-prometheus-alertmanager.monitoring.svc:9093

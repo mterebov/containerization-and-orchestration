@@ -1,0 +1,30 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-privileged-containers
+spec:
+  background: false
+  rules:
+    - name: containers-must-disallow-privileged
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      exclude:
+        any:
+          - resources:
+              namespaces: [kube-system, kyverno, monitoring, cnpg-system, local-path-storage]
+      validate:
+        failureAction: Enforce
+        message: "every container must disallow privileged"
+        pattern:
+          spec:
+            "=(ephemeralContainers)":
+              - "=(securityContext)":
+                  "=(privileged)": "false"
+            "=(initContainers)":
+              - "=(securityContext)":
+                  "=(privileged)": "false"
+            containers:
+              - "=(securityContext)":
+                  "=(privileged)": "false"

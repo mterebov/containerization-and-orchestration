@@ -1,0 +1,26 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-limits
+spec:
+  background: false
+  rules:
+    - name: containers-must-have-limits
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      exclude:
+        any:
+          - resources:
+              namespaces: [kube-system, kyverno, monitoring, cnpg-system, local-path-storage]
+      validate:
+        failureAction: Enforce
+        message: "every container must set resources.limits.cpu and resources.limits.memory"
+        pattern:
+          spec:
+            containers:
+              - resources:
+                  limits:
+                    cpu: "?*"
+                    memory: "?*"
