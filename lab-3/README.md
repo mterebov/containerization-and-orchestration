@@ -218,6 +218,80 @@ helm rollback shop 8 -n shop
 
 ## Часть 3 - Слон в ящике
 
+### Оператор
+
+Из двух операторов взяли CloudNativePG: у него один понятный объект `Cluster`, он активно живёт, и namespace `cnpg-system` мы уже заранее вынесли из-под политик. Оператор ставится один раз на весь кластер, values ему не нужны, дефолты не трогали, только пин версии:
+
+``` bash
+helm upgrade --install cnpg cnpg/cloudnative-pg --version 0.29.1 -n cnpg-system --create-namespace
+kubectl get crd | grep cnpg
+```
+
+![p3-operator](report/p3-operator.png)
+
+Список CRD это первая половина оператора: `Cluster`, `Backup`, `Pooler` и остальные стали обычными типами объектов в apiserver, их можно `kubectl get`, они лежат в etcd. Вторая половина это контроллер в `cnpg-system`, который за этими объектами следит.
+
+### База в чарте
+
+В чарт добавлен `templates/postgres-cluster.yaml`: одна нода postgres (kind на ноутбуке, реплики не нужны), том 1Gi, `resources` под `require-limits` и `inheritedMetadata.labels`, чтобы оператор навесил наш `app.kubernetes.io/name` на всё, что создаёт. Мы описываем только spec, а поды, PVC, сервисы `shop-db-rw`/`-ro`/`-r` и секрет `shop-db-app` делает оператор. В секрете есть ключ `uri` с готовой строкой подключения, его и отдаём `api` и `worker` в `DATABASE_URL` через `secretKeyRef`.
+
+После `helm upgrade` `api` и `worker` перекатились и сразу поднялись (секрет оператор создаёт раньше самой базы, а наши сервисы без базы живут), а вот `Cluster` завис в `Setting up primary`. В логах оператора причина: Kyverno отбил Job `shop-db-1-initdb`, у его init-контейнера образ `ghcr.io/cloudnative-pg/...`. Autogen сработал на `Job`, а не только на `Pod`.
+
+![p3-denied-job](report/p3-denied-job.png)
+
+Это ровно тот случай, ради которого правило про реестр закрывает init-контейнеры. Починили правило: `image: "shop.local/* | ghcr.io/cloudnative-pg/*"`.
+
+Дальше вылез второй слой. Оператор после отказа ушёл в backoff и не повторял попытку, пришлось подтолкнуть его аннотацией на `Cluster`. Job создался, но его под завис в `Pending`: PVC не провижнился. В событиях PVC:
+
+```
+failed to provision volume with StorageClass "standard": ... admission webhook "validate.kyverno.svc-fail" denied the request:
+resource Pod/local-path-storage/helper-pod-create-pvc-... was blocked due to the following policies
+require-labels: ... require-limits: ...
+```
+
+Провиженер `local-path` в kind на каждый том создаёт вспомогательный под в своём namespace `local-path-storage`, и его тоже поймали наши правила. Добавили `local-path-storage` в исключения всех пяти политик, PVC сразу стал `Bound`, initdb отработал, поднялся `shop-db-1`.
+
+![p3-db-running](report/p3-db-running.png)
+
+Вывод: cluster-wide правила ловят всё, включая поды, которые создаёт не человек, а оператор или провиженер. Список исключений это не костыль, а явное решение, кому правила не адресованы.
+
+### Заказы через базу
+
+``` bash
+curl -s -X POST localhost:30080/order -d '{"item":"book","qty":2}'
+curl -s -X POST localhost:30080/order
+sleep 7; curl -s localhost:30080/orders
+```
+
+Два заказа создались со `status: new`, через семь секунд worker их забрал (`orders processed, ids [1,2]` в логах), в `/orders` они уже `processed`, кластер `Cluster in healthy state`.
+
+![p3-orders](report/p3-orders.png)
+
+### Reconciliation на операторе
+
+Удалили под базы руками: `kubectl -n shop delete pod shop-db-1`. Оператор вернул его, и тут видна разница с Deployment: под вернулся с тем же именем `shop-db-1`, а не с новым случайным суффиксом, и с тем же томом. Инстансы postgres не взаимозаменяемы, поэтому оператор думает в терминах «инстанс 1 и его PVC», а не «любые N подов». Заказы в `/orders` пережили удаление, данные были на томе, а не в поде.
+
+![p3-after-delete](report/p3-after-delete.png)
+
+В объекте есть `spec` и `status`, строки 17 и 102 в YAML. Скрин снят в момент, когда оператор ещё чинил: в spec `instances: 1`, в status `phase: Waiting for the instances to become active`, `readyInstances` пустой, primary `shop-db-1`, PVC `shop-db-1` здоров. Это и есть reconcile-цикл вживую: spec говорит, как должно быть, status, как есть сейчас, контроллер закрывает разницу.
+
+![p3-spec-status](report/p3-spec-status.png)
+
+Через минуту всё сошлось:
+
+```
+NAME      AGE   INSTANCES   READY   STATUS                     PRIMARY
+shop-db   13m   1           1       Cluster in healthy state   shop-db-1
+NAME        READY   STATUS    RESTARTS   AGE
+shop-db-1   1/1     Running   0          57s
+NAME        STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS
+shop-db-1   Bound    pvc-bba814b8-0c1b-4e8e-ac12-2cd042e48094   1Gi        RWO            standard
+```
+
+### Чем оператор отличается от controller-manager
+
+Оба крутят один и тот же бесконечный reconcile-цикл: смотрят spec, сравнивают со status, чинят разницу. Разница в том, что они умеют чинить. Controller-manager это набор встроенных контроллеров для встроенных типов (Deployment, ReplicaSet, Job), и логика у них универсальная: должно быть N одинаковых подов, любой можно убить и заменить любым. Оператор это такой же контроллер, но для своего типа (`Cluster`) и со знанием предметной области: поды postgres не взаимозаменяемы, есть primary и реплики, перед стартом нужен `initdb`, том надо вернуть именно тому же инстансу, при смерти primary сделать failover. Это та часть, которую controller-manager про базу знать не может. Оператор это CRD плюс контроллер с доменной логикой, а не «разворачиватель».
+
 ## Часть 4 - Chaos Engineering эксперимент
 
 ## Часть 5 - Мониторинг

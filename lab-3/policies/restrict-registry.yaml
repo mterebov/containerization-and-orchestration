@@ -13,16 +13,16 @@ spec:
       exclude:
         any:
           - resources:
-              namespaces: [kube-system, kyverno, monitoring, cnpg-system]
+              namespaces: [kube-system, kyverno, monitoring, cnpg-system, local-path-storage]
       validate:
         failureAction: Enforce
         message: "every container image must start with 'shop.local/'"
         pattern:
           spec:
             =(ephemeralContainers):
-              - image: "shop.local/*"
+              - image: "shop.local/* | ghcr.io/cloudnative-pg/*"
             =(initContainers):
-              - image: "shop.local/*"
+              - image: "shop.local/* | ghcr.io/cloudnative-pg/*"
             containers:
-              - image: "shop.local/*"
+              - image: "shop.local/* | ghcr.io/cloudnative-pg/*"
               

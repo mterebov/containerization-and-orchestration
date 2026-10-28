@@ -13,7 +13,7 @@ spec:
       exclude:
         any:
           - resources:
-              namespaces: [kube-system, kyverno, monitoring, cnpg-system]
+              namespaces: [kube-system, kyverno, monitoring, cnpg-system, local-path-storage]
       validate:
         failureAction: Enforce
         message: "pod must have label app.kubernetes.io/name"

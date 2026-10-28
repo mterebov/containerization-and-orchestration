@@ -31,6 +31,11 @@ spec:
           env:
             - name: HEALTH_FAIL
               value: {{ .Values.worker.healthFail | quote }}
+            - name: DATABASE_URL          # строку подключения выдаёт оператор в секрете shop-db-app
+              valueFrom:
+                secretKeyRef:
+                  name: shop-db-app
+                  key: uri
           readinessProbe:             # не готов = убрать из endpoints сервиса, трафик не идёт
             httpGet:
               path: /health
