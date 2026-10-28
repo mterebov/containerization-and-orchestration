@@ -1,0 +1,10 @@
+# Kyverno: chart kyverno/kyverno 3.9.2 (app v1.19.2).
+# Оставляем только admission controller: он и есть validating webhook, который apiserver
+# дёргает на каждый запрос. Фоновое сканирование, отчёты и cleanup лабе не нужны,
+# а в kind на ноутбуке они просто едят память.
+backgroundController:
+  enabled: false
+reportsController:
+  enabled: false
+cleanupController:
+  enabled: false
