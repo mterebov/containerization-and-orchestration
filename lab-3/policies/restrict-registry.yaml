@@ -1,0 +1,28 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-registry
+spec:
+  background: false
+  rules:
+    - name: images-from-shop-local
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      exclude:
+        any:
+          - resources:
+              namespaces: [kube-system, kyverno, monitoring, cnpg-system]
+      validate:
+        failureAction: Enforce
+        message: "every container image must start with 'shop.local/'"
+        pattern:
+          spec:
+            =(ephemeralContainers):
+              - image: "shop.local/*"
+            =(initContainers):
+              - image: "shop.local/*"
+            containers:
+              - image: "shop.local/*"
+              
