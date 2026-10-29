@@ -115,8 +115,22 @@ postgres:
 
 monitoring:
   enabled: true                  # ServiceMonitor и PrometheusRule рендерятся, только если в кластере есть их CRD
+  # Критичный путь для алерта 2: поды этого класса приоритета (часть 5), сейчас api и postgres.
+  criticalPriorityClass: shop-critical
+  # Пороги трёх алертов (часть 9), сами выражения в templates/prometheusrule.yaml.
   alerts:
-    errorRate: 0.05              # доля 5xx, выше которой ApiHighErrorRate
-    errorRateFor: 2m
-    ordersStuckFor: 2m
-    replicasUnavailableFor: 3m
+    sla:                         # ShopOrderSLABreach: SLA из части 8 нарушен
+      latency: 0.25              # секунды; только граница бакета гистограммы api (0.1, 0.25, 0.5...), иначе запрос пустой и алерт молчит
+      target: 0.95               # доля заказов быстрее latency
+      errorRate: 0.01            # доля ответов 5xx
+      minRps: 1                  # если заказов в секунду меньше, не судим
+      # Окно 5m сглаживает всплески: в части 8 p99 доходил до 850 мс, а доля быстрых заказов
+      # за 5 минут не опускалась ниже 99.2%. for: ещё 2 минуты подтверждения.
+      for: 2m
+    throttling:                  # ShopCriticalPathCPUThrottled: критичный путь упёрся в limits.cpu
+      # Доля 100-мс интервалов CFS, где квота кончилась. В части 8 api с 50m доходил до 32%, и SLA
+      # держался, postgres с 20m в части 7 сидел на 100% и упал. 50%: спрос постоянно выше лимита.
+      ratio: 0.5
+      for: 2m                    # свежий под на старте жжёт CPU, первые секунды доля высокая
+    memoryPressure:              # ShopNodeMemoryPressure: давление памяти на ноде, kubelet выселяет
+      for: 1m                    # само условие и так держится 5 минут после давления

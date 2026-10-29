@@ -1,5 +1,12 @@
 {{- if and .Values.monitoring.enabled (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1") }}
-# Три алерта чарта. Prometheus Operator превратит объект в rule-файл и перечитает Prometheus.
+{{- $ns := .Release.Namespace }}
+{{- $a := .Values.monitoring.alerts }}
+{{- $critical := .Values.monitoring.criticalPriorityClass }}
+{{- $order := printf "namespace=%q, job=\"api\", route=\"/order\"" $ns }}
+# Три алерта лабы 4 (часть 9): симптом и две причины, почему именно они, в README.
+# Prometheus Operator превратит объект в rule-файл и перечитает Prometheus, Alertmanager из стека
+# шлёт их в alert-webhook. Пороги в values: monitoring.alerts. $value и $labels в аннотациях это
+# шаблоны самого Prometheus, от Helm они спрятаны в строковые литералы.
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -10,38 +17,70 @@ spec:
   groups:
     - name: shop
       rules:
-        - alert: ApiHighErrorRate
+        # 1. Симптом: SLA заказов из части 8 нарушен, это уже видят покупатели, поэтому critical.
+        #    Два правила под одним именем, как и у SLA две половины: время ответа и ошибки.
+        #    Без трафика не судим: при пустом кластере один curl с 503 это уже 100% ошибок.
+        - alert: ShopOrderSLABreach
           expr: |
-            sum(rate(http_requests_total{namespace="{{ .Release.Namespace }}", job="api", code=~"5.."}[2m]))
+            sum(rate(http_request_duration_seconds_bucket{ {{- $order }}, le="{{ $a.sla.latency }}"}[5m]))
               /
-            sum(rate(http_requests_total{namespace="{{ .Release.Namespace }}", job="api"}[2m]))
-              > {{ .Values.monitoring.alerts.errorRate }}
-          for: {{ .Values.monitoring.alerts.errorRateFor }}
+            sum(rate(http_request_duration_seconds_count{ {{- $order }}}[5m]))
+              < {{ $a.sla.target }}
+            and
+            sum(rate(http_requests_total{ {{- $order }}}[5m])) > {{ $a.sla.minRps }}
+          for: {{ $a.sla.for }}
           labels:
             severity: critical
-            service: api
+            namespace: {{ $ns }}        # после sum() меток нет, а Alertmanager группирует по namespace
+            sli: latency
           annotations:
-            summary: "api отдаёт 5xx: {{ "{{ $value | humanizePercentage }}" }} запросов"
-            description: "Больше {{ .Values.monitoring.alerts.errorRate }} ответов api это 5xx уже {{ .Values.monitoring.alerts.errorRateFor }}."
-        - alert: OrdersNotProcessed
+            summary: "SLA заказов нарушен: быстрее {{ mulf $a.sla.latency 1000 }} мс только {{ "{{ $value | humanizePercentage }}" }} заказов, нужно {{ mulf $a.sla.target 100 }}%"
+            description: "Путь api → postgres тормозит дольше {{ $a.sla.for }}. Причину искать в ShopCriticalPathCPUThrottled и на дашборде Lab 4: shop."
+        - alert: ShopOrderSLABreach
           expr: |
-            sum(increase(orders_created_total{namespace="{{ .Release.Namespace }}"}[5m])) > 0
-              and
-            (sum(increase(worker_orders_processed_total{namespace="{{ .Release.Namespace }}"}[5m])) or vector(0)) == 0
-          for: {{ .Values.monitoring.alerts.ordersStuckFor }}
+            sum(rate(http_requests_total{ {{- $order }}, code=~"5.."}[5m]))
+              /
+            sum(rate(http_requests_total{ {{- $order }}}[5m]))
+              > {{ $a.sla.errorRate }}
+            and
+            sum(rate(http_requests_total{ {{- $order }}}[5m])) > {{ $a.sla.minRps }}
+          for: {{ $a.sla.for }}
           labels:
             severity: critical
-            service: worker
+            namespace: {{ $ns }}
+            sli: errors
           annotations:
-            summary: "заказы создаются, но не обрабатываются"
-            description: "За 5 минут есть новые заказы, а worker не обработал ни одного. Либо worker лежит, либо не видит базу."
-        - alert: ApiReplicasUnavailable
-          expr: kube_deployment_status_replicas_unavailable{namespace="{{ .Release.Namespace }}", deployment="api"} > 0
-          for: {{ .Values.monitoring.alerts.replicasUnavailableFor }}
+            summary: "SLA заказов нарушен: {{ "{{ $value | humanizePercentage }}" }} заказов с ошибкой 5xx, можно не больше {{ mulf $a.sla.errorRate 100 }}%"
+            description: "api отдаёт 503, когда не может записать заказ в базу. Смотреть postgres: рестарты, пробы, ShopCriticalPathCPUThrottled."
+        # 2. Причина: под критичного пути упёрся в свой limits.cpu. Критичный путь это поды класса
+        #    criticalPriorityClass, а не список имён: batch упирается в потолок по задумке, его не трогаем.
+        - alert: ShopCriticalPathCPUThrottled
+          expr: |
+            sum by (namespace, pod, container) (rate(container_cpu_cfs_throttled_periods_total{namespace="{{ $ns }}", container!=""}[5m]))
+              /
+            sum by (namespace, pod, container) (rate(container_cpu_cfs_periods_total{namespace="{{ $ns }}", container!=""}[5m]))
+              > {{ $a.throttling.ratio }}
+            and on (namespace, pod)
+            kube_pod_info{namespace="{{ $ns }}", priority_class="{{ $critical }}"}
+          for: {{ $a.throttling.for }}
           labels:
             severity: warning
-            service: api
           annotations:
-            summary: "у api {{ "{{ $value }}" }} недоступных реплик"
-            description: "Deployment api дольше {{ .Values.monitoring.alerts.replicasUnavailableFor }} не может довести реплики до желаемого: застрявшая раскатка или поды не проходят readiness."
+            summary: "{{ "{{ $labels.pod }}" }} ({{ "{{ $labels.container }}" }}) упирается в limits.cpu в {{ "{{ $value | humanizePercentage }}" }} интервалов"
+            description: "Под критичного пути (класс {{ $critical }}, Guaranteed: limits = requests) хочет больше CPU, чем его лимит, и ждёт следующего 100-мс интервала CFS: растёт время ответа, не успевают пробы. Так в части 7 упал postgres. Поднять resources.cpu в values, считать от пика, а не от среднего."
+        # 3. Ёмкость: нода под MemoryPressure. Первым kubelet выселяет batch, это задуманная деградация,
+        #    поэтому warning, но taint закрывает ноду для любых новых подов, и критичному пути некуда
+        #    переехать. Сначала смотрели только ноды с подами критичного пути, но в части 9 раскатка api
+        #    под давлением увела его с ноды, и алерт погас при живом давлении. Поэтому любая нода:
+        #    в кластере на две ноды критичный путь живёт на обеих.
+        - alert: ShopNodeMemoryPressure
+          expr: |
+            max by (node) (kube_node_status_condition{condition="MemoryPressure", status="true"}) == 1
+          for: {{ $a.memoryPressure.for }}
+          labels:
+            severity: warning
+            namespace: {{ $ns }}
+          annotations:
+            summary: "Нода {{ "{{ $labels.node }}" }} под MemoryPressure: kubelet выселяет поды и не пускает новые"
+            description: "kubelet выселяет поды сверх requests, первым batch. Taint memory-pressure:NoSchedule не пустит на ноду и новый под api, а если память растёт быстрее, чем kubelet выселяет, придёт OOM killer ядра. Урезать batch (replicas, memoryMB) или добавить памяти."
 {{- end }}

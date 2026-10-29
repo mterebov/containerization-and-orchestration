@@ -35,10 +35,10 @@
       "panels": []
     },
     {
-      "id": 1,
-      "type": "timeseries",
-      "title": "SLA: доля заказов быстрее 250 мс",
-      "description": "SLI нашего SLA: доля POST /order, ответивших быстрее 250 мс. Граница 0.25 есть в гистограмме api, поэтому доля считается точно. SLA: не ниже 95%.",
+      "id": 11,
+      "type": "state-timeline",
+      "title": "Алерты чарта: pending и firing",
+      "description": "Три алерта из PrometheusRule чарта (часть 9). pending: условие выполнено, идёт отсчёт for. firing: алерт ушёл в Alertmanager.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -46,6 +46,116 @@
       "gridPos": {
         "x": 0,
         "y": 1,
+        "w": 24,
+        "h": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 2
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "ok",
+                  "color": "green",
+                  "index": 0
+                },
+                "1": {
+                  "text": "pending",
+                  "color": "orange",
+                  "index": 1
+                },
+                "2": {
+                  "text": "firing",
+                  "color": "red",
+                  "index": 2
+                }
+              }
+            }
+          ],
+          "custom": {
+            "fillOpacity": 70,
+            "lineWidth": 0
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showValue": "never",
+        "mergeValues": true,
+        "rowHeight": 0.8,
+        "alignValue": "left",
+        "legend": {
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "(max(ALERTS{namespace=\"shop\", alertname=\"ShopOrderSLABreach\", alertstate=\"firing\"}) * 2) or max(ALERTS{namespace=\"shop\", alertname=\"ShopOrderSLABreach\", alertstate=\"pending\"}) or vector(0)",
+          "legendFormat": "ShopOrderSLABreach"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "(max(ALERTS{namespace=\"shop\", alertname=\"ShopCriticalPathCPUThrottled\", alertstate=\"firing\"}) * 2) or max(ALERTS{namespace=\"shop\", alertname=\"ShopCriticalPathCPUThrottled\", alertstate=\"pending\"}) or vector(0)",
+          "legendFormat": "ShopCriticalPathCPUThrottled"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "(max(ALERTS{namespace=\"shop\", alertname=\"ShopNodeMemoryPressure\", alertstate=\"firing\"}) * 2) or max(ALERTS{namespace=\"shop\", alertname=\"ShopNodeMemoryPressure\", alertstate=\"pending\"}) or vector(0)",
+          "legendFormat": "ShopNodeMemoryPressure"
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "SLA: доля заказов быстрее 250 мс",
+      "description": "SLI нашего SLA: доля POST /order, ответивших быстрее 250 мс. Граница 0.25 есть в гистограмме api, поэтому доля считается точно. SLA: не ниже 95%. Здесь окно 1m, алерт ShopOrderSLABreach считает то же за 5m.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 6,
         "w": 12,
         "h": 8
       },
@@ -109,7 +219,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 1,
+        "y": 6,
         "w": 12,
         "h": 8
       },
@@ -182,7 +292,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 9,
+        "y": 14,
         "w": 12,
         "h": 8
       },
@@ -193,6 +303,7 @@
             "lineWidth": 2,
             "fillOpacity": 10,
             "drawStyle": "line",
+            "axisSoftMax": 0.02,
             "thresholdsStyle": {
               "mode": "line"
             }
@@ -246,7 +357,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 9,
+        "y": 14,
         "w": 12,
         "h": 8
       },
@@ -290,7 +401,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 17,
+        "y": 22,
         "w": 24,
         "h": 1
       },
@@ -307,7 +418,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 18,
+        "y": 23,
         "w": 12,
         "h": 8
       },
@@ -355,7 +466,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 18,
+        "y": 23,
         "w": 12,
         "h": 8
       },
@@ -403,7 +514,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 26,
+        "y": 31,
         "w": 12,
         "h": 8
       },
@@ -467,7 +578,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 26,
+        "y": 31,
         "w": 12,
         "h": 8
       },
@@ -508,14 +619,14 @@
       "id": 9,
       "type": "timeseries",
       "title": "CPU throttling: доля интервалов, где контейнер упёрся в limit",
-      "description": "Guaranteed api и postgres не должны упираться в потолок, а batch упирается: он хочет целое ядро.",
+      "description": "Guaranteed api и postgres не должны упираться в потолок, а batch упирается: он хочет целое ядро. Красная линия: 50%, порог ShopCriticalPathCPUThrottled (алерт считает по каждому поду за 5m).",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
       "gridPos": {
         "x": 0,
-        "y": 34,
+        "y": 39,
         "w": 12,
         "h": 8
       },
@@ -525,10 +636,26 @@
           "custom": {
             "lineWidth": 2,
             "fillOpacity": 10,
-            "drawStyle": "line"
+            "drawStyle": "line",
+            "thresholdsStyle": {
+              "mode": "line"
+            }
           },
           "min": 0,
-          "max": 1
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.5
+              }
+            ]
+          }
         },
         "overrides": []
       },
@@ -564,7 +691,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 34,
+        "y": 39,
         "w": 12,
         "h": 8
       },
