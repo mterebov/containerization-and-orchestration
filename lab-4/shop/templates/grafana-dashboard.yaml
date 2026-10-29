@@ -1,14 +1,17 @@
 {{- if .Values.monitoring.enabled }}
 # Grafana из kube-prometheus-stack подхватывает ConfigMap-ы с лейблом grafana_dashboard
 # через sidecar (searchNamespace: ALL в values стека). Сам JSON лежит в dashboards/shop.json.
+# Имя ConfigMap и файла не те, что в лабе 3: Grafana 12 не даёт поменять uid у дашборда,
+# загруженного из того же файла (failed to save dashboard: deprecatedInternalID is already in use),
+# а с новым файлом она заводит новый дашборд, а старый удаляет вместе со старым файлом.
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: shop-dashboard
+  name: shop-sla-dashboard
   labels:
     app.kubernetes.io/name: shop
     grafana_dashboard: "1"
 data:
-  shop.json: |-
+  shop-sla.json: |-
 {{ .Files.Get "dashboards/shop.json" | indent 4 }}
 {{- end }}

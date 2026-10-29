@@ -1,77 +1,51 @@
 {
-  "uid": "lab3-shop",
-  "title": "Lab 3: shop",
+  "uid": "lab4-shop",
+  "title": "Lab 4: shop — SLA под перегрузкой",
   "tags": [
-    "lab3",
+    "lab4",
     "shop"
   ],
   "timezone": "browser",
   "schemaVersion": 39,
   "version": 1,
   "editable": true,
-  "refresh": "15s",
+  "refresh": "10s",
   "time": {
     "from": "now-30m",
     "to": "now"
   },
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  },
   "panels": [
+    {
+      "id": 100,
+      "type": "row",
+      "title": "SLA: путь заказа (POST /order)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
     {
       "id": 1,
       "type": "timeseries",
-      "title": "api: запросов в секунду по коду",
+      "title": "SLA: доля заказов быстрее 250 мс",
+      "description": "SLI нашего SLA: доля POST /order, ответивших быстрее 250 мс. Граница 0.25 есть в гистограмме api, поэтому доля считается точно. SLA: не ниже 95%.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
       "gridPos": {
         "x": 0,
-        "y": 0,
-        "w": 12,
-        "h": 8
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "reqps",
-          "custom": {
-            "lineWidth": 2,
-            "fillOpacity": 10
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "sum by (code) (rate(http_requests_total{namespace=\"shop\", job=\"api\"}[2m]))",
-          "legendFormat": "{{code}}"
-        }
-      ],
-      "description": "RED: rate. Все HTTP-запросы к api, включая пробы kubelet."
-    },
-    {
-      "id": 2,
-      "type": "timeseries",
-      "title": "api: доля 5xx (алерт ApiHighErrorRate > 5%)",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "gridPos": {
-        "x": 12,
-        "y": 0,
+        "y": 1,
         "w": 12,
         "h": 8
       },
@@ -80,10 +54,26 @@
           "unit": "percentunit",
           "custom": {
             "lineWidth": 2,
-            "fillOpacity": 10
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "thresholdsStyle": {
+              "mode": "line"
+            }
           },
           "max": 1,
-          "min": 0
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 0.95
+              }
+            ]
+          }
         },
         "overrides": []
       },
@@ -103,23 +93,23 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(rate(http_requests_total{namespace=\"shop\", job=\"api\", code=~\"5..\"}[2m])) / sum(rate(http_requests_total{namespace=\"shop\", job=\"api\"}[2m]))",
-          "legendFormat": "5xx share"
+          "expr": "sum(rate(http_request_duration_seconds_bucket{namespace=\"shop\", job=\"api\", route=\"/order\", le=\"0.25\"}[1m])) / sum(rate(http_request_duration_seconds_count{namespace=\"shop\", job=\"api\", route=\"/order\"}[1m]))",
+          "legendFormat": "быстрее 250 мс"
         }
-      ],
-      "description": "RED: errors."
+      ]
     },
     {
-      "id": 3,
+      "id": 2,
       "type": "timeseries",
-      "title": "api: p95 времени ответа",
+      "title": "POST /order: p95 и p99 времени ответа",
+      "description": "Перцентили из гистограммы api (приблизительные, интерполяция внутри бакета). Красная линия: 250 мс из SLA.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
       "gridPos": {
-        "x": 0,
-        "y": 8,
+        "x": 12,
+        "y": 1,
         "w": 12,
         "h": 8
       },
@@ -128,7 +118,25 @@
           "unit": "s",
           "custom": {
             "lineWidth": 2,
-            "fillOpacity": 10
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.25
+              }
+            ]
           }
         },
         "overrides": []
@@ -149,54 +157,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{namespace=\"shop\", job=\"api\"}[2m])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{namespace=\"shop\", job=\"api\", route=\"/order\"}[1m])))",
           "legendFormat": "p95"
-        }
-      ],
-      "description": "RED: duration."
-    },
-    {
-      "id": 4,
-      "type": "timeseries",
-      "title": "заказы: создано и обработано за 5 минут (алерт OrdersNotProcessed)",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "gridPos": {
-        "x": 12,
-        "y": 8,
-        "w": 12,
-        "h": 8
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "custom": {
-            "lineWidth": 2,
-            "fillOpacity": 10
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "sum(increase(orders_created_total{namespace=\"shop\"}[5m]))",
-          "legendFormat": "created"
         },
         {
           "refId": "B",
@@ -204,34 +166,98 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(increase(worker_orders_processed_total{namespace=\"shop\"}[5m])) or vector(0)",
-          "legendFormat": "processed"
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{namespace=\"shop\", job=\"api\", route=\"/order\"}[1m])))",
+          "legendFormat": "p99"
         }
-      ],
-      "description": "Бизнес-метрика: если created растёт, а processed нет, worker не работает."
+      ]
     },
     {
-      "id": 5,
+      "id": 3,
       "type": "timeseries",
-      "title": "db_up по подам (1 = база доступна)",
+      "title": "POST /order: доля ошибок 5xx",
+      "description": "Вторая половина SLA: ошибок меньше 1%. 503 api отдаёт, когда база недоступна.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
       "gridPos": {
         "x": 0,
-        "y": 16,
+        "y": 9,
         "w": 12,
         "h": 8
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "short",
+          "unit": "percentunit",
           "custom": {
             "lineWidth": 2,
-            "fillOpacity": 10
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "thresholdsStyle": {
+              "mode": "line"
+            }
           },
-          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.01
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "(sum(rate(http_requests_total{namespace=\"shop\", job=\"api\", route=\"/order\", code=~\"5..\"}[1m])) or vector(0)) / sum(rate(http_requests_total{namespace=\"shop\", job=\"api\", route=\"/order\"}[1m]))",
+          "legendFormat": "доля 5xx"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "POST /order: запросов в секунду по коду",
+      "description": "Нагрузка k6: 50 заказов в секунду.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 9,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "drawStyle": "line"
+          },
           "min": 0
         },
         "overrides": []
@@ -252,23 +278,36 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "db_up{namespace=\"shop\"}",
-          "legendFormat": "{{job}}/{{pod}}"
+          "expr": "sum by (code) (rate(http_requests_total{namespace=\"shop\", job=\"api\", route=\"/order\"}[1m]))",
+          "legendFormat": "{{code}}"
         }
-      ],
-      "description": "Каждый под api и worker сам пингует postgres раз в 5 секунд."
+      ]
     },
     {
-      "id": 6,
+      "id": 101,
+      "type": "row",
+      "title": "Кто страдает: batch и ноды",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 17,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 5,
       "type": "timeseries",
-      "title": "api: реплики desired / available / unavailable (алерт ApiReplicasUnavailable)",
+      "title": "batch: сделанная работа",
+      "description": "Сколько хешей в секунду считают все batch вместе. Проседает, когда batch вытесняют, выселяют или держат в Pending.",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
       "gridPos": {
-        "x": 12,
-        "y": 16,
+        "x": 0,
+        "y": 18,
         "w": 12,
         "h": 8
       },
@@ -277,7 +316,121 @@
           "unit": "short",
           "custom": {
             "lineWidth": 2,
-            "fillOpacity": 10
+            "fillOpacity": 10,
+            "drawStyle": "line"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(batch_work_total{namespace=\"shop\"}[1m]))",
+          "legendFormat": "хешей в секунду"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "batch: поды по фазам",
+      "description": "Running против Pending: сколько batch реально работает, а сколько ждёт места.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 18,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "drawStyle": "line"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (phase) (kube_pod_status_phase{namespace=\"shop\", pod=~\"batch-.*\"}) > 0",
+          "legendFormat": "{{phase}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Память подов на нодах и порог выселения",
+      "description": "Сумма working set подов по нодам. Красная линия: 2816Mi, allocatable ноды. Выше неё kubelet начинает выселять.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 2952790016
+              }
+            ]
           }
         },
         "overrides": []
@@ -298,8 +451,153 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "kube_deployment_spec_replicas{namespace=\"shop\", deployment=\"api\"}",
-          "legendFormat": "desired"
+          "expr": "sum by (node) (container_memory_working_set_bytes{container!=\"\", container!=\"POD\"})",
+          "legendFormat": "{{node}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "kubelet: выселения",
+      "description": "Сколько подов kubelet выселил за минуту, по нодам и сигналу. allocatableMemory.available: подам на ноде не хватает памяти.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 26,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "drawStyle": "bars"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (node, eviction_signal) (increase(kubelet_evictions[1m]))",
+          "legendFormat": "{{node}} {{eviction_signal}}"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "CPU throttling: доля интервалов, где контейнер упёрся в limit",
+      "description": "Guaranteed api и postgres не должны упираться в потолок, а batch упирается: он хочет целое ядро.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 34,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "drawStyle": "line"
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (container) (rate(container_cpu_cfs_throttled_periods_total{namespace=\"shop\", container=~\"api|postgres|batch\"}[1m])) / sum by (container) (rate(container_cpu_cfs_periods_total{namespace=\"shop\", container=~\"api|postgres|batch\"}[1m]))",
+          "legendFormat": "{{container}}"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "api и postgres: реплики и рестарты",
+      "description": "Критичный путь должен пережить перегрузку: реплики api на месте, у postgres нет новых рестартов.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 34,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "drawStyle": "line"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "kube_deployment_status_replicas_available{namespace=\"shop\", deployment=\"api\"}",
+          "legendFormat": "api: доступных реплик"
         },
         {
           "refId": "B",
@@ -307,26 +605,10 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "kube_deployment_status_replicas_available{namespace=\"shop\", deployment=\"api\"}",
-          "legendFormat": "available"
-        },
-        {
-          "refId": "C",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "kube_deployment_status_replicas_unavailable{namespace=\"shop\", deployment=\"api\"}",
-          "legendFormat": "unavailable"
+          "expr": "sum(kube_pod_container_status_restarts_total{namespace=\"shop\", container=\"postgres\"})",
+          "legendFormat": "postgres: рестартов"
         }
-      ],
-      "description": "Из kube-state-metrics. unavailable > 0 дольше 3 минут = застрявшая раскатка."
+      ]
     }
-  ],
-  "templating": {
-    "list": []
-  },
-  "annotations": {
-    "list": []
-  }
+  ]
 }
