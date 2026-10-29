@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  labels:
+    app.kubernetes.io/name: worker
+spec:
+  replicas: {{ .Values.worker.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: worker
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1          # сначала поднять один новый под...
+      maxUnavailable: 0    # ...и только потом убрать один старый: по одному, без просадки
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: worker   # require-labels, autogen проверяет именно template
+    spec:
+      securityContext:
+        runAsNonRoot: true            # require-nonroot
+      containers:
+        - name: worker
+          image: "{{ .Values.worker.image.repository }}:{{ .Values.worker.image.tag }}"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8081
+          env:
+            - name: HEALTH_FAIL
+              value: {{ .Values.worker.healthFail | quote }}
+            - name: DATABASE_URL          # строку подключения выдаёт оператор в секрете shop-db-app
+              valueFrom:
+                secretKeyRef:
+                  name: shop-db-app
+                  key: uri
+          readinessProbe:             # не готов = убрать из endpoints сервиса, трафик не идёт
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:              # не жив = kubelet перезапустит контейнер
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}

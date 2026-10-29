@@ -1,0 +1,47 @@
+{{- if and .Values.monitoring.enabled (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1") }}
+# Три алерта чарта. Prometheus Operator превратит объект в rule-файл и перечитает Prometheus.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: shop
+  labels:
+    app.kubernetes.io/name: shop
+spec:
+  groups:
+    - name: shop
+      rules:
+        - alert: ApiHighErrorRate
+          expr: |
+            sum(rate(http_requests_total{namespace="{{ .Release.Namespace }}", job="api", code=~"5.."}[2m]))
+              /
+            sum(rate(http_requests_total{namespace="{{ .Release.Namespace }}", job="api"}[2m]))
+              > {{ .Values.monitoring.alerts.errorRate }}
+          for: {{ .Values.monitoring.alerts.errorRateFor }}
+          labels:
+            severity: critical
+            service: api
+          annotations:
+            summary: "api отдаёт 5xx: {{ "{{ $value | humanizePercentage }}" }} запросов"
+            description: "Больше {{ .Values.monitoring.alerts.errorRate }} ответов api это 5xx уже {{ .Values.monitoring.alerts.errorRateFor }}."
+        - alert: OrdersNotProcessed
+          expr: |
+            sum(increase(orders_created_total{namespace="{{ .Release.Namespace }}"}[5m])) > 0
+              and
+            (sum(increase(worker_orders_processed_total{namespace="{{ .Release.Namespace }}"}[5m])) or vector(0)) == 0
+          for: {{ .Values.monitoring.alerts.ordersStuckFor }}
+          labels:
+            severity: critical
+            service: worker
+          annotations:
+            summary: "заказы создаются, но не обрабатываются"
+            description: "За 5 минут есть новые заказы, а worker не обработал ни одного. Либо worker лежит, либо не видит базу."
+        - alert: ApiReplicasUnavailable
+          expr: kube_deployment_status_replicas_unavailable{namespace="{{ .Release.Namespace }}", deployment="api"} > 0
+          for: {{ .Values.monitoring.alerts.replicasUnavailableFor }}
+          labels:
+            severity: warning
+            service: api
+          annotations:
+            summary: "у api {{ "{{ $value }}" }} недоступных реплик"
+            description: "Deployment api дольше {{ .Values.monitoring.alerts.replicasUnavailableFor }} не может довести реплики до желаемого: застрявшая раскатка или поды не проходят readiness."
+{{- end }}

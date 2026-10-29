@@ -1,0 +1,14 @@
+{{- if .Values.monitoring.enabled }}
+# Grafana из kube-prometheus-stack подхватывает ConfigMap-ы с лейблом grafana_dashboard
+# через sidecar (searchNamespace: ALL в values стека). Сам JSON лежит в dashboards/shop.json.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shop-dashboard
+  labels:
+    app.kubernetes.io/name: shop
+    grafana_dashboard: "1"
+data:
+  shop.json: |-
+{{ .Files.Get "dashboards/shop.json" | indent 4 }}
+{{- end }}
