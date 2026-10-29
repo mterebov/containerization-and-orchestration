@@ -1,0 +1,21 @@
+{{- /*
+Классы приоритета. Число из класса планировщик сравнивает, когда решает, кого вытеснить
+ради места (preemption), а kubelet учитывает, когда выбирает, кого выселить первым при
+нехватке памяти на ноде. Объекты кластерные, без namespace. Поды без класса получают 0.
+*/ -}}
+{{- range $name, $pc := .Values.priorityClasses }}
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: {{ $name }}
+  labels:
+    app.kubernetes.io/name: shop
+{{- /* | int: иначе большое число из values Helm отрендерит как 1e+06, а apiserver ждёт целое */}}
+value: {{ $pc.value | int }}
+globalDefault: false
+{{- with $pc.preemptionPolicy }}
+preemptionPolicy: {{ . }}
+{{- end }}
+description: {{ $pc.description | quote }}
+{{- end }}

@@ -1,0 +1,36 @@
+{{- /*
+PodDisruptionBudget: сколько подов должно остаться живыми при добровольном выселении
+(kubectl drain, обновление нод, всё, что идёт через eviction API). От preemption он
+защищает только по возможности, а от выселения kubelet-ом при нехватке памяти не защищает.
+*/ -}}
+{{- if .Values.api.pdb.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api
+  labels:
+    app.kubernetes.io/name: api
+spec:
+  minAvailable: {{ .Values.api.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api
+{{- end }}
+{{- if .Values.postgres.pdb.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  # Не shop-db: с enablePDB: false оператор удаляет PDB с именами shop-db и shop-db-primary,
+  # не проверяя, чьи они, и наш PDB под таким именем он стёр.
+  name: postgres
+  labels:
+    app.kubernetes.io/name: shop-db
+spec:
+  minAvailable: {{ .Values.postgres.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      cnpg.io/cluster: shop-db
+      cnpg.io/podRole: instance       # только поды самой базы, без Job-ов оператора
+{{- end }}

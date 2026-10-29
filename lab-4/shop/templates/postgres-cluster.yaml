@@ -12,6 +12,12 @@ spec:
     size: {{ .Values.postgres.storage }}
   resources:                        # уедут в контейнер postgres: require-limits
     {{- toYaml .Values.postgres.resources | nindent 4 }}
+  {{- with .Values.postgres.priorityClassName }}
+  priorityClassName: {{ . }}
+  {{- end }}
+  # PDB базы ставит чарт (pdb.yaml), операторский тогда выключаем: на под с двумя PDB
+  # eviction API отвечает ошибкой, и любой drain встаёт
+  enablePDB: {{ not .Values.postgres.pdb.enabled }}
   inheritedMetadata:                # лейблы, которые оператор навесит на свои поды: require-labels
     labels:
       app.kubernetes.io/name: shop-db

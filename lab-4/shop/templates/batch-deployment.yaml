@@ -18,6 +18,9 @@ spec:
     spec:
       securityContext:
         runAsNonRoot: true            # require-nonroot
+      {{- with .Values.batch.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
       # доделывать batch нечего: при preemption и eviction пусть уходит сразу и освобождает место
       terminationGracePeriodSeconds: 5
       containers:

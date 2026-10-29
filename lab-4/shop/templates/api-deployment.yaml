@@ -21,6 +21,9 @@ spec:
     spec:
       securityContext:
         runAsNonRoot: true            # require-nonroot
+      {{- with .Values.api.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
       # разнесение реплик по нодам, механизм из values: api.spread
       {{- include "shop.spread" (dict "app" "api" "spread" .Values.api.spread) | nindent 6 }}
       containers:

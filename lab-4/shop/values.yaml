@@ -1,4 +1,17 @@
 # Все ручки чарта. Шаблоны читают только отсюда: то, чего здесь нет, в шаблоне захардкожено.
+
+# Классы приоритета (часть 5): кого планировщик вытесняет ради места (preemption) и кого
+# kubelet выселяет первым при нехватке памяти. Поды без класса (worker, мониторинг,
+# Kyverno) получают приоритет 0.
+priorityClasses:
+  shop-critical:
+    value: 1000000                 # путь заказа: api и postgres
+    description: "shop: критичный путь заказа, api и postgres"
+  shop-batch:
+    value: -100                    # ниже всех, даже подов без класса: под давлением batch уходит первым
+    preemptionPolicy: Never        # и сам никого не вытесняет, а ждёт места в Pending
+    description: "shop: фоновая аналитика, жертвуем первой"
+
 api:
   image:
     repository: shop.local/api   # образ грузится в kind, реестр в имени нужен правилу restrict-registry
@@ -13,16 +26,21 @@ api:
     topologyKey: kubernetes.io/hostname    # домен разнесения: нода (в облаке была бы зона)
     maxSkew: 1                             # только для topologySpreadConstraints
     hard: true                   # true: правило нельзя нарушить, под ждёт в Pending; false: только подсказка при выборе ноды
-  # Числа из krr (часть 3, 50 заказов/с 15 минут): CPU 10m, память 100Mi request = limit.
-  # Это его минимумы: реально под нагрузкой ~5m и ~10Mi. CPU limit krr советует не ставить,
-  # но require-limits его требует, поэтому оставлен прежний.
+  priorityClassName: shop-critical
+  # Guaranteed (часть 5): requests = limits на числах из krr (часть 3). Память 100Mi как есть.
+  # CPU krr дал как request (95-й перцентиль минутных средних, под нагрузкой ~6m, его минимум 10m),
+  # а в Guaranteed он становится и потолком, который режет каждые 100 мс: всплески внутри минуты
+  # (сборка мусора, сбор метрик) krr не видит. Поэтому CPU с запасом в 2 раза: 20m.
   resources:
     requests:
-      cpu: 10m
+      cpu: 20m
       memory: 100Mi
     limits:
-      cpu: 200m
+      cpu: 20m
       memory: 100Mi
+  pdb:
+    enabled: true
+    minAvailable: 1                # из двух реплик добровольно выселить можно только одну
   service:
     nodePort: 30080              # совпадает с extraPortMappings в kind.yaml
 
@@ -48,28 +66,37 @@ batch:
   cpuWorkers: 1                  # горутин, жгущих CPU; каждая хочет целое ядро, limits.cpu её режет
   memoryMB: 64                   # сколько памяти держать
   memoryStepMB: 8                # с какой скоростью набирать память, МБ/с: медленно, чтобы kubelet успел заметить нехватку
-  resources:                     # фоновая работа: требует немного, но может разогнаться до limits
+  priorityClassName: shop-batch
+  # Burstable (часть 5): requests сильно ниже limits. Резервирует мало, а разогнаться может
+  # до целого ядра и гигабайта. Всё, что сверх requests, ему не гарантировано.
+  resources:
     requests:
       cpu: 250m
       memory: 128Mi
     limits:
-      cpu: 500m
-      memory: 512Mi
+      cpu: "1"
+      memory: 1Gi
 
 postgres:
   instances: 1                  # одна нода postgres, без реплик: kind на ноутбуке
   storage: 1Gi
+  priorityClassName: shop-critical
   # krr не видит поды CloudNativePG, посчитано его же формулой в Prometheus:
   # CPU p95 = 9.4m -> 10m. Память max + 15% = 97Mi, но берём 256Mi: в postgres
   # shared_buffers = 128MB, этот кеш заполняется по мере роста таблиц, а за час
   # истории с маленькой таблицей krr его просто не увидел.
+  # Guaranteed (часть 5): requests = limits. CPU по той же причине, что у api, с запасом
+  # в 2 раза: 9.4m под нагрузкой упирались бы ровно в потолок 10m.
   resources:
     requests:
-      cpu: 10m
+      cpu: 20m
       memory: 256Mi
     limits:
-      cpu: 500m
+      cpu: 20m
       memory: 256Mi
+  pdb:
+    enabled: true                  # свой PDB вместо операторского (enablePDB: false в Cluster)
+    minAvailable: 1                # единственный инстанс базы добровольно не выселяется вообще
 
 monitoring:
   enabled: true                  # ServiceMonitor и PrometheusRule рендерятся, только если в кластере есть их CRD
