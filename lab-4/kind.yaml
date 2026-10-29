@@ -1,0 +1,46 @@
+# kind-кластер для лабы 4: две ноды, обе маленькие нарочно, чтобы дефицит ловился легко.
+#
+# Обе kind-ноды это контейнеры в одной VM Docker Desktop, и каждая видит всю VM целиком
+# (10 CPU / 7.75Gi). Поэтому «маленькой» ноду делаем через kubelet: systemReserved отдаёт
+# большую часть VM «системе» (на деле это вторая нода и сам Docker), подам остаётся мало.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: lab
+kubeadmConfigPatches:
+  # Конфиг kubelet общий для обеих нод.
+  - |
+    kind: KubeletConfiguration
+    # Allocatable = capacity - systemReserved - evictionHard:
+    #   cpu    10 - 8.5 = 1.5 ядра на ноду (из них ~1 на control plane уже заняты
+    #          его собственными подами: apiserver, etcd, coredns...);
+    #   memory 7936Mi - 4608Mi - 512Mi = 2816Mi (2.75Gi) на ноду.
+    # Подам (cgroup kubepods) достаётся 7936Mi - 4608Mi = 3.25Gi: на двух нодах 6.5Gi,
+    # это влезает в VM вместе с самим Docker.
+    systemReserved:
+      cpu: 8500m
+      memory: 4608Mi
+    # kind по умолчанию переопределяет evictionHard одними дисковыми порогами,
+    # и порога по памяти нет вообще: kubelet не выселяет поды, ноду спасает только
+    # OOM-killer ядра. Возвращаем порог: подам не хватает памяти, когда до их предела
+    # осталось меньше 512Mi, и kubelet начинает выселять. Дисковые пороги оставляем
+    # выключенными, как у kind, иначе на ноутбуке поды вылетали бы из-за места на диске.
+    evictionHard:
+      memory.available: 512Mi
+      nodefs.available: "0%"
+      nodefs.inodesFree: "0%"
+      imagefs.available: "0%"
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      # Без taint на control plane: иначе обычным подам осталась бы одна нода
+      # и разносить api было бы некуда.
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          taints: []
+    # Порт 30080 мака на NodePort api, как в лабе 3: k6 бьёт в него с хоста.
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 30080
+        protocol: TCP
+  - role: worker

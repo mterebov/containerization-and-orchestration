@@ -1,0 +1,50 @@
+# batch: «ночная аналитика», фоновая нагрузка, которой жертвуем под давлением.
+# Правила из лабы 3 действуют без исключений: лейбл, limits, non-root, образ shop.local.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: batch
+  labels:
+    app.kubernetes.io/name: batch
+spec:
+  replicas: {{ .Values.batch.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: batch
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: batch   # require-labels
+    spec:
+      securityContext:
+        runAsNonRoot: true            # require-nonroot
+      # доделывать batch нечего: при preemption и eviction пусть уходит сразу и освобождает место
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: batch
+          image: "{{ .Values.batch.image.repository }}:{{ .Values.batch.image.tag }}"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8082
+          env:
+            - name: CPU_WORKERS
+              value: {{ .Values.batch.cpuWorkers | quote }}
+            - name: MEMORY_MB
+              value: {{ .Values.batch.memoryMB | quote }}
+            - name: MEMORY_STEP_MB
+              value: {{ .Values.batch.memoryStepMB | quote }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.batch.resources | nindent 12 }}

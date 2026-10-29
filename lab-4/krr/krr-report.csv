@@ -1,0 +1,4 @@
+Namespace,Name,Pods,Old Pods,Type,Container,Severity,CPU Diff,CPU Requests,CPU Limits,Memory Diff,Memory Requests,Memory Limits
+shop,api,2,0,Deployment,api,WARNING,-80m,(-40m) 50m -> 10m,200m -> unset,+136Mi,(+68Mi) 32Mi -> 100Mi,128Mi -> 100Mi
+shop,batch,2,0,Deployment,batch,WARNING,+502m,(+251m) 250m -> 501m,500m -> unset,-56Mi,(-28Mi) 128Mi -> 100Mi,512Mi -> 100Mi
+shop,worker,2,0,Deployment,worker,WARNING,-80m,(-40m) 50m -> 10m,200m -> unset,+136Mi,(+68Mi) 32Mi -> 100Mi,128Mi -> 100Mi

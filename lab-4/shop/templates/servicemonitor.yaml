@@ -8,12 +8,12 @@ metadata:
   labels:
     app.kubernetes.io/name: shop
 spec:
-  jobLabel: app.kubernetes.io/name      # job=api / job=worker в метриках
+  jobLabel: app.kubernetes.io/name      # job=api / job=worker / job=batch в метриках
   selector:
     matchExpressions:
       - key: app.kubernetes.io/name
         operator: In
-        values: [api, worker]
+        values: [api, worker, batch]
   endpoints:
     - port: http
       path: /metrics
