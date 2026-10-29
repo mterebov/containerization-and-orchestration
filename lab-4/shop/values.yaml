@@ -62,8 +62,12 @@ batch:
   image:
     repository: shop.local/batch
     tag: "0.1.0"
-  replicas: 2
-  cpuWorkers: 1                  # горутин, жгущих CPU; каждая хочет целое ядро, limits.cpu её режет
+  # Часть 6: реплик больше, чем помещается. По requests (250m) влезает 7: две на control plane,
+  # пять на worker, остальные ждут в Pending.
+  replicas: 10
+  # Часть 6: batch не жжёт CPU, чтобы было видно, что планировщик смотрит на requests, а не на
+  # реальную загрузку: ноды почти простаивают, а места для новых подов нет. Обычно 1.
+  cpuWorkers: 0                  # горутин, жгущих CPU; каждая хочет целое ядро, limits.cpu её режет
   memoryMB: 64                   # сколько памяти держать
   memoryStepMB: 8                # с какой скоростью набирать память, МБ/с: медленно, чтобы kubelet успел заметить нехватку
   priorityClassName: shop-batch

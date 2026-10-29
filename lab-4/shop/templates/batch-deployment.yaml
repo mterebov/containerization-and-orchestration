@@ -8,6 +8,16 @@ metadata:
     app.kubernetes.io/name: batch
 spec:
   replicas: {{ .Values.batch.replicas }}
+  # Раскатка без запаса: новых подов сверх replicas не поднимаем (maxSurge: 0), старые можно
+  # гасить все сразу (maxUnavailable: 100%). Простой фоновой аналитике не страшен, а обычная
+  # раскатка в тесном кластере на время занимала бы место дважды. По сути это Recreate, но
+  # type: Recreate сюда не переключить: Helm 4 применяет манифест на стороне сервера, и
+  # оставшийся от старой стратегии rollingUpdate apiserver с Recreate не принимает.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 100%
   selector:
     matchLabels:
       app.kubernetes.io/name: batch
